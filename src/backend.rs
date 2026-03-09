@@ -115,7 +115,7 @@ struct StartAckDetails {
 #[derive(Serialize)]
 struct BackendConfigPayload {
     transactions: u32,
-    accounts: Vec<String>,
+    account: String,
     commitment: String,
 }
 
@@ -548,9 +548,18 @@ fn compute_proof(
 
 impl BackendConfigPayload {
     fn from_config(config: &Config) -> Self {
+        let account = config.account.first().cloned().unwrap_or_default();
+        if config.account.len() > 1 {
+            warn!(
+                account = %account,
+                total_accounts = config.account.len(),
+                "Streaming backend only accepts a single account in the start payload; sending the first configured account"
+            );
+        }
+
         Self {
             transactions: config.transactions.max(0) as u32,
-            accounts: config.account.clone(),
+            account,
             commitment: config.commitment.as_str().to_string(),
         }
     }
@@ -564,6 +573,32 @@ impl BackendEndpointPayload {
             kind: Some(endpoint.kind.as_str().to_string()),
             resolved_ip: provided_ip,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendConfigPayload;
+    use crate::config::{ArgsCommitment, Config};
+
+    #[test]
+    fn backend_payload_uses_first_account_for_legacy_schema() {
+        let config = Config {
+            transactions: 42,
+            account: vec![
+                "11111111111111111111111111111111".to_string(),
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+            ],
+            commitment: ArgsCommitment::Confirmed,
+        };
+
+        let payload = BackendConfigPayload::from_config(&config);
+        let json = serde_json::to_value(&payload).expect("payload should serialize");
+
+        assert_eq!(json["transactions"], 42);
+        assert_eq!(json["account"], "11111111111111111111111111111111");
+        assert_eq!(json["commitment"], "confirmed");
+        assert!(json.get("accounts").is_none());
     }
 }
 
