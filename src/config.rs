@@ -14,7 +14,7 @@ pub struct ConfigToml {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
     pub transactions: i32,
-    pub account: String,
+    pub account: Vec<String>,
     pub commitment: ArgsCommitment,
 }
 
@@ -104,7 +104,7 @@ impl ConfigToml {
         let default_config = ConfigToml {
             config: Config {
                 transactions: 1000,
-                account: "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".to_string(),
+                account: vec!["pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA".to_string()],
                 commitment: ArgsCommitment::Processed,
             },
             endpoint: vec![
@@ -138,5 +138,94 @@ impl ConfigToml {
         } else {
             Self::create_default(path)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ArgsCommitment, ConfigToml};
+    use crate::providers::common::WatchedAccounts;
+    use std::{
+        env, fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    fn temp_config_path(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        env::temp_dir().join(format!("geyserbench-{prefix}-{unique}.toml"))
+    }
+
+    #[test]
+    fn deserializes_account_array() {
+        let raw = r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111", "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"]
+commitment = "confirmed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://localhost:10000"
+kind = "yellowstone"
+"#;
+
+        let parsed: ConfigToml = toml::from_str(raw).expect("config should deserialize");
+
+        assert_eq!(
+            parsed.config.account,
+            vec![
+                "11111111111111111111111111111111".to_string(),
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string()
+            ]
+        );
+        assert!(matches!(
+            parsed.config.commitment,
+            ArgsCommitment::Confirmed
+        ));
+    }
+
+    #[test]
+    fn create_default_writes_account_array_syntax() {
+        let path = temp_config_path("default");
+
+        let created = ConfigToml::create_default(path.to_str().expect("utf-8 temp path"))
+            .expect("default config should be created");
+        let written = fs::read_to_string(&path).expect("default config should be readable");
+
+        assert_eq!(created.config.account.len(), 1);
+        assert!(written.contains("account = ["));
+        assert!(!written.contains("account = \""));
+
+        let parsed = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("written config should parse");
+        assert_eq!(parsed.config.account, created.config.account);
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn invalid_pubkey_values_fail_with_clear_error() {
+        let raw = r#"
+[config]
+transactions = 1000
+account = ["not-a-pubkey"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://localhost:10000"
+kind = "yellowstone"
+"#;
+
+        let parsed: ConfigToml = toml::from_str(raw).expect("config should deserialize");
+        let err = WatchedAccounts::new(&parsed.config.account)
+            .expect_err("invalid account should fail validation");
+
+        assert!(err.to_string().contains("config.account[0]"));
+        assert!(err.to_string().contains("not-a-pubkey"));
     }
 }

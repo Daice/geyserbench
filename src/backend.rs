@@ -115,7 +115,7 @@ struct StartAckDetails {
 #[derive(Serialize)]
 struct BackendConfigPayload {
     transactions: u32,
-    account: String,
+    accounts: Vec<String>,
     commitment: String,
 }
 
@@ -550,7 +550,7 @@ impl BackendConfigPayload {
     fn from_config(config: &Config) -> Self {
         Self {
             transactions: config.transactions.max(0) as u32,
-            account: config.account.clone(),
+            accounts: config.account.clone(),
             commitment: config.commitment.as_str().to_string(),
         }
     }

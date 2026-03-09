@@ -1,6 +1,5 @@
 use futures::{SinkExt, channel::mpsc::unbounded};
 use futures_util::stream::StreamExt;
-use solana_pubkey::Pubkey;
 use std::{collections::HashMap, error::Error, sync::atomic::Ordering};
 use tokio::task;
 use tracing::{Level, info};
@@ -13,7 +12,8 @@ use crate::{
 use super::{
     GeyserProvider, ProviderContext,
     common::{
-        TransactionAccumulator, build_signature_envelope, enqueue_signature, fatal_connection_error,
+        TransactionAccumulator, WatchedAccounts, build_signature_envelope, enqueue_signature,
+        fatal_connection_error,
     },
 };
 
@@ -56,7 +56,7 @@ async fn process_jetstream_endpoint(
         progress,
     } = context;
     let signature_sender = signature_tx;
-    let account_pubkey = config.account.parse::<Pubkey>()?;
+    let watched_accounts = WatchedAccounts::new(&config.account)?;
     let endpoint_name = endpoint.name.clone();
     let mut log_file = if tracing::enabled!(Level::TRACE) {
         Some(open_log_file(&endpoint_name)?)
@@ -79,8 +79,8 @@ async fn process_jetstream_endpoint(
         String::from("account"),
         jetstream::SubscribeRequestFilterTransactions {
             account_exclude: vec![],
-            account_include: vec![],
-            account_required: vec![config.account.clone()],
+            account_include: watched_accounts.filters().to_vec(),
+            account_required: vec![],
         },
     );
 
@@ -114,7 +114,7 @@ async fn process_jetstream_endpoint(
                 let has_account = tx_info
                     .account_keys
                     .iter()
-                    .any(|key| key.as_slice() == account_pubkey.as_ref());
+                    .any(|key| watched_accounts.matches_bytes(key.as_slice()));
                 if !has_account { continue }
 
                 let wallclock = get_current_timestamp();

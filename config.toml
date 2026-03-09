@@ -1,14 +1,38 @@
 [config]
 transactions = 1000
-account = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+account = [
+    "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",     # raydium
+    "CPMMoo8L3F4NbTegBCKVNunggL7H1ZpdTHKxQB5qKP1C",     # raydium_cp
+    "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",     # raydium_clmm
+    "24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHDS2SG3LYwBpyTi",     # meteora vault
+    "Eo7WjKq67rjJQSZxS6z3YkapzY3eMj6Xy8X5EQVn5UaB",     # meteora
+    "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",      # meteora_dlmm
+    "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",      # whirlpool
+#    "5jnapfrAN47UYkLkEf7HnprPPBCQLvkYWGZDeKkaP5hv",     # Daos.fun
+    "SoLFiHG9TfgtdUXUjWAxi3LtvYuFyDLVhBWxdMZxyCe",      # Solfi
+    "SV2EYYJyRz2YhfXwXnhNAevDEui5Q6yrfyo13WtupPF",      # SolFiV2
+#    "2wT8Yq49kHgDzXuPxZSaeLaH1qbmGXtEyPy64bL7aD3c",     # lifinity
+    "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",      # pump_amm
+    "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG",      # meteora dammV2
+    "srAMMzfVHVAtgSJc8iH6CfKzuWuUTzLHVCE81QU1rgi",      # plasma
+    "HpNfyc2Saw7RKkQd8nEL4khUcuPhQ7WwY1B2qjx8jxFq",     # pancake
+    "JoeGXemoPqPeGPEXA3Z3UbjoPoGqqfbg8PD58M7Rqj2",      # token_mill_v2
+    "REALQqNEomY6cQGZJUGwywTBD2UmDT32rZcNnfxQ5N2",      # byreal
+    "fUSioN9YKKSa3CUC2YUc4tPkHJ5Y6XW1yz8y6F7qWz9",      # fusion
+    "SSwapUtytfBdBn1b9NUGG6foMVPtcWgpRU32HToDUZr",      # saros
+    "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP",     # orca_v2
+    "9H6tua7jkLhdm3w8BvgpTn5LZNU7g4ZynDmCiNN3q6Rp",     # humidifi
+    "BiSoNHVpsVZW2F7rx2eQ59yQwKxzU5NvBcmKshCSUypi",     # bisonfi
+    "TessVdML9pBGgG9yGks7o4HewRaXVAMuoVj4x83GLQH",      # tesserav
+]
 commitment = "processed"
 
 [[endpoint]]
-name = "Endpoint 1"
-url = "http://arpc.fra.corvus-labs.io:20202"
-kind = "arpc"
+name = "Local"
+url = "http://127.0.0.1:10003"
+kind = "yellowstone"
 
 [[endpoint]]
-name = "Endpoint 2"
-url = "http://fra.corvus-labs.io:10101"
+name = "Corvus"
+url = "http://ams.corvus-labs.io:10101"
 kind = "yellowstone"

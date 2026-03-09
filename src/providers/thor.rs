@@ -6,16 +6,16 @@ use crate::{
 };
 
 use futures_util::StreamExt;
-use solana_pubkey::Pubkey;
-use thorstreamer_grpc_client::{ClientConfig, ThorClient, parse_message};
 use thorstreamer_grpc_client::proto::thor_streamer::types::message_wrapper::EventMessage;
+use thorstreamer_grpc_client::{ClientConfig, ThorClient, parse_message};
 use tokio::task;
 use tracing::{Level, info};
 
 use super::{
     GeyserProvider, ProviderContext,
     common::{
-        TransactionAccumulator, build_signature_envelope, enqueue_signature, fatal_connection_error,
+        TransactionAccumulator, WatchedAccounts, build_signature_envelope, enqueue_signature,
+        fatal_connection_error,
     },
 };
 
@@ -51,7 +51,7 @@ async fn process_thor_endpoint(
         progress,
     } = context;
     let signature_sender = signature_tx;
-    let account_pubkey = config.account.parse::<Pubkey>()?;
+    let watched_accounts = WatchedAccounts::new(&config.account)?;
     let endpoint_name = endpoint.name.clone();
 
     let mut log_file = if tracing::enabled!(Level::TRACE) {
@@ -104,7 +104,7 @@ async fn process_thor_endpoint(
                 let has_account = message
                     .account_keys
                     .iter()
-                    .any(|key| key.as_slice() == account_pubkey.as_ref());
+                    .any(|key| watched_accounts.matches_bytes(key.as_slice()));
 
                 if has_account {
                     let wallclock = get_current_timestamp();

@@ -1,6 +1,8 @@
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::{Context, Result, bail};
 use crossbeam_queue::ArrayQueue;
+use solana_pubkey::Pubkey;
 use tracing::{error, warn};
 
 use crate::{
@@ -11,6 +13,47 @@ use crate::{
 #[derive(Default)]
 pub struct TransactionAccumulator {
     entries: HashMap<String, TransactionData>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WatchedAccounts {
+    filters: Vec<String>,
+    pubkeys: Vec<Pubkey>,
+}
+
+impl WatchedAccounts {
+    pub fn new(accounts: &[String]) -> Result<Self> {
+        if accounts.is_empty() {
+            bail!("config.account must contain at least one pubkey");
+        }
+
+        let mut pubkeys = Vec::with_capacity(accounts.len());
+        for (index, account) in accounts.iter().enumerate() {
+            let pubkey = account
+                .parse::<Pubkey>()
+                .with_context(|| format!("invalid pubkey in config.account[{index}]: {account}"))?;
+            pubkeys.push(pubkey);
+        }
+
+        Ok(Self {
+            filters: accounts.to_vec(),
+            pubkeys,
+        })
+    }
+
+    pub fn filters(&self) -> &[String] {
+        &self.filters
+    }
+
+    pub fn matches_pubkey(&self, pubkey: &Pubkey) -> bool {
+        self.pubkeys.iter().any(|candidate| candidate == pubkey)
+    }
+
+    pub fn matches_bytes(&self, bytes: &[u8]) -> bool {
+        self.pubkeys
+            .iter()
+            .any(|candidate| candidate.as_ref() == bytes)
+    }
 }
 
 impl TransactionAccumulator {
@@ -88,5 +131,50 @@ pub fn enqueue_signature(
 ) {
     if sender.push(envelope).is_err() {
         warn!(endpoint = endpoint, signature = %signature, "Signature queue full; dropping observation");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WatchedAccounts;
+    use solana_pubkey::Pubkey;
+
+    #[test]
+    fn watched_accounts_match_any_pubkey_and_preserve_filters() {
+        let filters = vec![
+            "11111111111111111111111111111111".to_string(),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+        ];
+        let watched = WatchedAccounts::new(&filters).expect("accounts should parse");
+        let matched = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            .parse::<Pubkey>()
+            .expect("valid pubkey");
+        let unmatched = "Vote111111111111111111111111111111111111111"
+            .parse::<Pubkey>()
+            .expect("valid pubkey");
+
+        assert_eq!(watched.filters(), filters.as_slice());
+        assert!(watched.matches_pubkey(&matched));
+        assert!(!watched.matches_pubkey(&unmatched));
+    }
+
+    #[test]
+    fn watched_accounts_match_any_raw_pubkey_bytes() {
+        let filters = vec![
+            "11111111111111111111111111111111".to_string(),
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA".to_string(),
+        ];
+        let watched = WatchedAccounts::new(&filters).expect("accounts should parse");
+        let matched = "11111111111111111111111111111111"
+            .parse::<Pubkey>()
+            .expect("valid pubkey");
+        let unmatched = "Vote111111111111111111111111111111111111111"
+            .parse::<Pubkey>()
+            .expect("valid pubkey");
+        let matched_bytes = matched.to_bytes();
+        let unmatched_bytes = unmatched.to_bytes();
+
+        assert!(watched.matches_bytes(matched_bytes.as_slice()));
+        assert!(!watched.matches_bytes(unmatched_bytes.as_slice()));
     }
 }
