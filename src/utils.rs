@@ -1,4 +1,5 @@
 use dashmap::{DashMap, DashSet};
+use prost_types::Timestamp;
 use std::{
     collections::HashMap,
     fs::OpenOptions,
@@ -13,6 +14,7 @@ pub struct TransactionData {
     pub wallclock_secs: f64,
     pub elapsed_since_start: Duration,
     pub start_wallclock_secs: f64,
+    pub yellowstone_created_at_delta_ms: Option<f64>,
 }
 
 #[derive(Debug)]
@@ -147,6 +149,14 @@ pub fn get_current_timestamp() -> f64 {
     since_epoch.as_secs_f64()
 }
 
+pub fn protobuf_timestamp_to_unix_ms(timestamp: &Timestamp) -> Option<f64> {
+    if !(0..1_000_000_000).contains(&timestamp.nanos) {
+        return None;
+    }
+
+    Some((timestamp.seconds as f64 * 1_000.0) + (timestamp.nanos as f64 / 1_000_000.0))
+}
+
 pub fn percentile(sorted_data: &[f64], p: f64) -> f64 {
     if sorted_data.is_empty() {
         return 0.0;
@@ -189,5 +199,21 @@ fn sanitize_filename(name: &str) -> String {
         "endpoint".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protobuf_timestamp_to_unix_ms;
+    use prost_types::Timestamp;
+
+    #[test]
+    fn protobuf_timestamp_to_unix_ms_rejects_invalid_nanos() {
+        let timestamp = Timestamp {
+            seconds: 1,
+            nanos: 1_000_000_000,
+        };
+
+        assert_eq!(protobuf_timestamp_to_unix_ms(&timestamp), None);
     }
 }

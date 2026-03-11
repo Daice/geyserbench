@@ -12,7 +12,10 @@ use crate::proto::geyser::{
 
 use crate::{
     config::{Config, Endpoint},
-    utils::{TransactionData, get_current_timestamp, open_log_file, write_log_entry},
+    utils::{
+        TransactionData, get_current_timestamp, open_log_file, protobuf_timestamp_to_unix_ms,
+        write_log_entry,
+    },
 };
 
 use super::{
@@ -136,6 +139,13 @@ async fn process_yellowstone_endpoint(
             message = stream.next() => {
                 match message {
                     Some(Ok(msg)) => {
+                        let receive_wallclock_secs = get_current_timestamp();
+                        let created_at_delta_ms = msg
+                            .created_at
+                            .as_ref()
+                            .and_then(protobuf_timestamp_to_unix_ms)
+                            .map(|created_at_ms| (receive_wallclock_secs * 1_000.0) - created_at_ms);
+
                         match msg.update_oneof {
                             Some(UpdateOneof::Transaction(tx_msg)) => {
                                 if let Some(tx) = tx_msg.transaction.as_ref()
@@ -164,6 +174,7 @@ async fn process_yellowstone_endpoint(
                                                 wallclock_secs: wallclock,
                                                 elapsed_since_start: elapsed,
                                                 start_wallclock_secs,
+                                                yellowstone_created_at_delta_ms: created_at_delta_ms,
                                             };
 
                                             let updated = accumulator.record(

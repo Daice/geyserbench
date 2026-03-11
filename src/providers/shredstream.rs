@@ -119,6 +119,7 @@ async fn process_shredstream_endpoint(
                         wallclock_secs: wallclock,
                         elapsed_since_start: elapsed,
                         start_wallclock_secs,
+                        yellowstone_created_at_delta_ms: None,
                     };
 
                     let updated = accumulator.record(

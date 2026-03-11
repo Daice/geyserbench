@@ -205,6 +205,12 @@ async fn main() -> Result<()> {
 
     let mut handles = Vec::new();
     let endpoint_names: Vec<String> = config.endpoint.iter().map(|e| e.name.clone()).collect();
+    let yellowstone_endpoint_names: Vec<String> = config
+        .endpoint
+        .iter()
+        .filter(|endpoint| endpoint.kind == config::EndpointKind::Yellowstone)
+        .map(|endpoint| endpoint.name.clone())
+        .collect();
     let global_target = if config.config.transactions > 0 {
         Some(config.config.transactions as usize)
     } else {
@@ -271,6 +277,7 @@ async fn main() -> Result<()> {
         Some(analysis::compute_run_summary(
             comparator.as_ref(),
             &endpoint_names,
+            &yellowstone_endpoint_names,
         ))
     } else {
         None
