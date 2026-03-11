@@ -124,7 +124,7 @@ async fn main() -> Result<()> {
     let mut forwarder_stop: Option<Arc<AtomicBool>> = None;
     let mut backend_run_id = None;
 
-    if backend_settings.enabled {
+    if backend_settings.enabled && false {
         let url = backend_settings
             .url
             .clone()
