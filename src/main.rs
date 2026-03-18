@@ -5,6 +5,7 @@ pub use {
     serde::{Deserialize, Serialize},
     std::{
         env,
+        path::Path,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -36,6 +37,8 @@ const SIGNATURE_QUEUE_CAPACITY: usize = 1_024;
 struct CliArgs {
     config_path: Option<String>,
     disable_streaming: bool,
+    metrics_json_path: Option<String>,
+    compare_json_paths: Option<(String, String)>,
 }
 
 impl CliArgs {
@@ -44,6 +47,8 @@ impl CliArgs {
         let mut parsed = CliArgs {
             config_path: None,
             disable_streaming: false,
+            metrics_json_path: None,
+            compare_json_paths: None,
         };
 
         while let Some(arg) = args.next() {
@@ -55,6 +60,27 @@ impl CliArgs {
                         std::process::exit(1);
                     });
                     parsed.config_path = Some(value);
+                }
+                "--metrics-json" => {
+                    let value = args.next().unwrap_or_else(|| {
+                        eprintln!("Missing value for --metrics-json");
+                        print_usage();
+                        std::process::exit(1);
+                    });
+                    parsed.metrics_json_path = Some(value);
+                }
+                "--compare-json" => {
+                    let left = args.next().unwrap_or_else(|| {
+                        eprintln!("Missing left path for --compare-json");
+                        print_usage();
+                        std::process::exit(1);
+                    });
+                    let right = args.next().unwrap_or_else(|| {
+                        eprintln!("Missing right path for --compare-json");
+                        print_usage();
+                        std::process::exit(1);
+                    });
+                    parsed.compare_json_paths = Some((left, right));
                 }
                 "--private" => {
                     parsed.disable_streaming = true;
@@ -71,12 +97,33 @@ impl CliArgs {
             }
         }
 
+        if parsed.compare_json_paths.is_some()
+            && (parsed.config_path.is_some()
+                || parsed.disable_streaming
+                || parsed.metrics_json_path.is_some())
+        {
+            eprintln!(
+                "--compare-json cannot be combined with --config, --private, or --metrics-json"
+            );
+            print_usage();
+            std::process::exit(1);
+        }
+
         parsed
     }
 }
 
 fn print_usage() {
-    eprintln!("Usage: geyserbench [--config <PATH>] [--private]");
+    eprintln!("Usage:");
+    eprintln!("  geyserbench [--config <PATH>] [--private] [--metrics-json <PATH|->]");
+    eprintln!("  geyserbench --compare-json <LEFT_JSON> <RIGHT_JSON>");
+}
+
+fn display_label(path: &str) -> &str {
+    Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(path)
 }
 
 #[tokio::main]
@@ -90,9 +137,22 @@ async fn main() -> Result<()> {
         .map_err(|err| anyhow!(err))?;
 
     let cli = CliArgs::parse();
+    if let Some((left_path, right_path)) = cli.compare_json_paths.as_ref() {
+        let left_report = analysis::load_metrics_report(left_path)?;
+        let right_report = analysis::load_metrics_report(right_path)?;
+        let comparison = analysis::compare_metrics_reports(&left_report, &right_report)?;
+        analysis::display_metrics_comparison(
+            &comparison,
+            display_label(left_path),
+            display_label(right_path),
+        );
+        return Ok(());
+    }
+
     let config_path = cli.config_path.as_deref().unwrap_or(DEFAULT_CONFIG_PATH);
     let config = config::ConfigToml::load_or_create(config_path)?;
     info!(config_path = config_path, "Loaded configuration");
+    let metrics_json_stdout = cli.metrics_json_path.as_deref() == Some("-");
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -321,14 +381,44 @@ async fn main() -> Result<()> {
         );
     }
 
+    let run_finished_at_unix_secs = get_current_timestamp();
+    let metrics_report = if !run_aborted {
+        run_summary.as_ref().map(|summary| {
+            analysis::build_metrics_report(
+                summary,
+                comparator.as_ref(),
+                &config.config,
+                &config.endpoint,
+                start_time_local,
+                run_finished_at_unix_secs,
+            )
+        })
+    } else {
+        None
+    };
+
     if !run_aborted {
         if let Some(summary) = run_summary.as_ref() {
-            analysis::display_run_summary(summary);
-            let metrics_json = analysis::build_metrics_report(summary);
+            if !metrics_json_stdout {
+                analysis::display_run_summary(summary);
+            }
+        }
+
+        if let Some(report) = metrics_report.as_ref() {
+            let metrics_json = serde_json::to_string(report)
+                .map_err(|err| anyhow!("failed to serialize metrics report: {err}"))?;
             debug!(metrics = %metrics_json, "Computed run metrics");
         }
 
-        if let Some(run_id) = backend_run_id {
+        if let (Some(path), Some(report)) =
+            (cli.metrics_json_path.as_deref(), metrics_report.as_ref())
+        {
+            analysis::write_metrics_report(report, path)?;
+        }
+
+        if let Some(run_id) = backend_run_id
+            && !metrics_json_stdout
+        {
             println!("🔗 Share this benchmark run: https://runs.solstack.app/run/{run_id}");
         }
     } else {

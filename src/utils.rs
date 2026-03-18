@@ -15,6 +15,7 @@ pub struct TransactionData {
     pub elapsed_since_start: Duration,
     pub start_wallclock_secs: f64,
     pub yellowstone_created_at_delta_ms: Option<f64>,
+    pub yellowstone_created_at_zero: bool,
 }
 
 #[derive(Debug)]

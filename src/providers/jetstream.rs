@@ -130,6 +130,7 @@ async fn process_jetstream_endpoint(
                     elapsed_since_start: elapsed,
                     start_wallclock_secs,
                     yellowstone_created_at_delta_ms: None,
+                    yellowstone_created_at_zero: false,
                 };
 
                 let updated = accumulator.record(signature.clone(), tx_data.clone());

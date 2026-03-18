@@ -140,11 +140,18 @@ async fn process_yellowstone_endpoint(
                 match message {
                     Some(Ok(msg)) => {
                         let receive_wallclock_secs = get_current_timestamp();
-                        let created_at_delta_ms = msg
+                        let created_at_raw_ms = msg
                             .created_at
                             .as_ref()
-                            .and_then(protobuf_timestamp_to_unix_ms)
-                            .map(|created_at_ms| (receive_wallclock_secs * 1_000.0) - created_at_ms);
+                            .and_then(protobuf_timestamp_to_unix_ms);
+                        let (created_at_delta_ms, created_at_zero) = match created_at_raw_ms {
+                            Some(0.0) => (None, true),
+                            Some(created_at_ms) => (
+                                Some((receive_wallclock_secs * 1_000.0) - created_at_ms),
+                                false,
+                            ),
+                            None => (None, false),
+                        };
 
                         match msg.update_oneof {
                             Some(UpdateOneof::Transaction(tx_msg)) => {
@@ -175,6 +182,7 @@ async fn process_yellowstone_endpoint(
                                                 elapsed_since_start: elapsed,
                                                 start_wallclock_secs,
                                                 yellowstone_created_at_delta_ms: created_at_delta_ms,
+                                                yellowstone_created_at_zero: created_at_zero,
                                             };
 
                                             let updated = accumulator.record(
