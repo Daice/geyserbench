@@ -139,6 +139,7 @@ pub struct MetricsYellowstoneCreatedAtReport {
 
 #[derive(Debug, Clone)]
 pub struct MetricsComparison {
+    pub endpoint_name: String,
     pub endpoint_url: String,
     pub endpoint_kind: String,
     pub account: Vec<String>,
@@ -420,24 +421,7 @@ pub fn load_metrics_report(path: &str) -> Result<MetricsReport> {
 pub fn compare_metrics_reports(
     left: &MetricsReport,
     right: &MetricsReport,
-) -> Result<MetricsComparison> {
-    let left_side = select_comparable_endpoint(left)?;
-    let right_side = select_comparable_endpoint(right)?;
-
-    if left_side.endpoint_metrics.endpoint_url != right_side.endpoint_metrics.endpoint_url {
-        bail!(
-            "metrics reports target different endpoint_url values: '{}' vs '{}'",
-            left_side.endpoint_metrics.endpoint_url,
-            right_side.endpoint_metrics.endpoint_url
-        );
-    }
-    if left_side.endpoint_metrics.endpoint_kind != right_side.endpoint_metrics.endpoint_kind {
-        bail!(
-            "metrics reports target different endpoint_kind values: '{}' vs '{}'",
-            left_side.endpoint_metrics.endpoint_kind,
-            right_side.endpoint_metrics.endpoint_kind
-        );
-    }
+) -> Result<Vec<MetricsComparison>> {
     if left.account != right.account {
         bail!("metrics reports use different account filters");
     }
@@ -449,38 +433,85 @@ pub fn compare_metrics_reports(
         );
     }
 
-    let mut unreliability_reasons = Vec::new();
-    collect_reliability_issues("left", &left_side.local_summary, &mut unreliability_reasons);
-    collect_reliability_issues(
-        "right",
-        &right_side.local_summary,
-        &mut unreliability_reasons,
-    );
+    let left_endpoints = collect_comparable_endpoints(left);
+    let right_endpoints = collect_comparable_endpoints(right);
 
-    let reliable_for_latency = unreliability_reasons.is_empty();
-    let stability_winner = reliable_for_latency.then(|| {
-        ordering_to_winner(compare_stability(
+    let mut shared_endpoint_names = left_endpoints
+        .keys()
+        .filter(|name| right_endpoints.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if shared_endpoint_names.is_empty() {
+        bail!("metrics reports do not share any comparable Yellowstone endpoint names");
+    }
+
+    shared_endpoint_names.sort();
+
+    let mut comparisons = Vec::with_capacity(shared_endpoint_names.len());
+    for endpoint_name in shared_endpoint_names {
+        let left_side = left_endpoints
+            .get(&endpoint_name)
+            .expect("shared endpoint should exist on left")
+            .clone();
+        let right_side = right_endpoints
+            .get(&endpoint_name)
+            .expect("shared endpoint should exist on right")
+            .clone();
+
+        if left_side.endpoint_metrics.endpoint_url != right_side.endpoint_metrics.endpoint_url {
+            bail!(
+                "metrics reports target different endpoint_url values for '{}': '{}' vs '{}'",
+                endpoint_name,
+                left_side.endpoint_metrics.endpoint_url,
+                right_side.endpoint_metrics.endpoint_url
+            );
+        }
+        if left_side.endpoint_metrics.endpoint_kind != right_side.endpoint_metrics.endpoint_kind {
+            bail!(
+                "metrics reports target different endpoint_kind values for '{}': '{}' vs '{}'",
+                endpoint_name,
+                left_side.endpoint_metrics.endpoint_kind,
+                right_side.endpoint_metrics.endpoint_kind
+            );
+        }
+
+        let mut unreliability_reasons = Vec::new();
+        collect_reliability_issues("left", &left_side.local_summary, &mut unreliability_reasons);
+        collect_reliability_issues(
+            "right",
+            &right_side.local_summary,
+            &mut unreliability_reasons,
+        );
+
+        let reliable_for_latency = unreliability_reasons.is_empty();
+        let stability_winner = reliable_for_latency.then(|| {
+            ordering_to_winner(compare_stability(
+                &left_side.local_summary,
+                &right_side.local_summary,
+            ))
+        });
+        let data_quality_winner = ordering_to_winner(compare_quality(
             &left_side.local_summary,
             &right_side.local_summary,
-        ))
-    });
-    let data_quality_winner = ordering_to_winner(compare_quality(
-        &left_side.local_summary,
-        &right_side.local_summary,
-    ));
+        ));
 
-    Ok(MetricsComparison {
-        endpoint_url: left_side.endpoint_metrics.endpoint_url.clone(),
-        endpoint_kind: left_side.endpoint_metrics.endpoint_kind.clone(),
-        account: left.account.clone(),
-        commitment: left.commitment.clone(),
-        reliable_for_latency,
-        unreliability_reasons,
-        stability_winner,
-        data_quality_winner,
-        left: left_side,
-        right: right_side,
-    })
+        comparisons.push(MetricsComparison {
+            endpoint_name: endpoint_name.clone(),
+            endpoint_url: left_side.endpoint_metrics.endpoint_url.clone(),
+            endpoint_kind: left_side.endpoint_metrics.endpoint_kind.clone(),
+            account: left.account.clone(),
+            commitment: left.commitment.clone(),
+            reliable_for_latency,
+            unreliability_reasons,
+            stability_winner,
+            data_quality_winner,
+            left: left_side,
+            right: right_side,
+        });
+    }
+
+    Ok(comparisons)
 }
 
 pub fn display_metrics_comparison(
@@ -490,6 +521,7 @@ pub fn display_metrics_comparison(
 ) {
     println!("\nAsync Yellowstone comparison");
     println!("--------------------------------------------");
+    println!("Endpoint name: {}", comparison.endpoint_name);
     println!("Endpoint URL: {}", comparison.endpoint_url);
     println!("Endpoint kind: {}", comparison.endpoint_kind);
     println!("Commitment: {}", comparison.commitment);
@@ -771,27 +803,23 @@ fn display_yellowstone_created_at_summary(summary: &YellowstoneCreatedAtSummary)
     println!("{table}");
 }
 
-fn select_comparable_endpoint(report: &MetricsReport) -> Result<MetricsComparisonSide> {
-    let mut endpoints = report.per_endpoint.iter().filter_map(|(name, endpoint)| {
-        endpoint
-            .yellowstone_endpoint_local
-            .as_ref()
-            .map(|summary| MetricsComparisonSide {
-                endpoint_name: name.clone(),
-                endpoint_metrics: endpoint.clone(),
-                local_summary: summary.clone(),
+fn collect_comparable_endpoints(report: &MetricsReport) -> BTreeMap<String, MetricsComparisonSide> {
+    report
+        .per_endpoint
+        .iter()
+        .filter_map(|(name, endpoint)| {
+            endpoint.yellowstone_endpoint_local.as_ref().map(|summary| {
+                (
+                    name.clone(),
+                    MetricsComparisonSide {
+                        endpoint_name: name.clone(),
+                        endpoint_metrics: endpoint.clone(),
+                        local_summary: summary.clone(),
+                    },
+                )
             })
-    });
-
-    let Some(first) = endpoints.next() else {
-        bail!("metrics report does not contain a comparable Yellowstone endpoint");
-    };
-
-    if endpoints.next().is_some() {
-        bail!("metrics report must contain exactly one Yellowstone endpoint for comparison");
-    }
-
-    Ok(first)
+        })
+        .collect()
 }
 
 fn collect_reliability_issues(
@@ -1003,15 +1031,15 @@ fn ordering_to_winner(ordering: Ordering) -> ComparisonWinner {
 #[cfg(test)]
 mod tests {
     use super::{
-        ComparisonWinner, MetricsReport, build_metrics_report, compare_metrics_reports,
-        compute_run_summary,
+        ComparisonWinner, MetricsEndpointReport, MetricsReport, YellowstoneEndpointLocalSummary,
+        build_metrics_report, compare_metrics_reports, compute_run_summary,
     };
     use crate::{
         config::{ArgsCommitment, Config, Endpoint, EndpointKind},
         utils::Comparator,
         utils::TransactionData,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::time::Duration;
 
     fn tx(
@@ -1488,8 +1516,9 @@ mod tests {
             110.0,
         );
 
-        let comparison = compare_metrics_reports(&left_report, &right_report)
+        let mut comparisons = compare_metrics_reports(&left_report, &right_report)
             .expect("comparison should succeed");
+        let comparison = comparisons.pop().expect("single comparison should exist");
 
         assert!(!comparison.reliable_for_latency);
         assert!(comparison.stability_winner.is_none());
@@ -1543,11 +1572,100 @@ mod tests {
             110.0,
         );
 
-        let comparison = compare_metrics_reports(&left_report, &right_report)
+        let mut comparisons = compare_metrics_reports(&left_report, &right_report)
             .expect("comparison should succeed");
+        let comparison = comparisons.pop().expect("single comparison should exist");
 
         assert!(comparison.reliable_for_latency);
         assert_eq!(comparison.stability_winner, Some(ComparisonWinner::Left));
         assert_eq!(comparison.data_quality_winner, ComparisonWinner::Left);
+    }
+
+    #[test]
+    fn compare_supports_multiple_shared_yellowstone_endpoints() {
+        let build_report = |local_delta: f64, corvus_delta: f64| MetricsReport {
+            account: vec!["11111111111111111111111111111111".to_string()],
+            commitment: "processed".to_string(),
+            run_started_at_unix_ms: 1_000.0,
+            run_finished_at_unix_ms: 2_000.0,
+            total_signatures: 240,
+            backfill_signatures: 0,
+            yellowstone_created_at: None,
+            per_endpoint: BTreeMap::from([
+                (
+                    "Local".to_string(),
+                    MetricsEndpointReport {
+                        endpoint_url: "http://127.0.0.1:10003".to_string(),
+                        endpoint_kind: "yellowstone".to_string(),
+                        first_detection_rate: 0.5,
+                        p50_latency_ms: Some(0.0),
+                        p95_latency_ms: Some(0.0),
+                        p99_latency_ms: Some(0.0),
+                        observations: 240,
+                        first_detections: 120,
+                        backfill_transactions: 0,
+                        yellowstone_endpoint_local: Some(YellowstoneEndpointLocalSummary {
+                            observed_signatures: 240,
+                            live_observations: 240,
+                            eligible_created_at: 240,
+                            missing_created_at: 0,
+                            zero_created_at: 0,
+                            eligible_ratio: Some(1.0),
+                            zero_created_at_rate: Some(0.0),
+                            backfill_rate: Some(0.0),
+                            raw_p50_delta_ms: Some(local_delta),
+                            raw_p95_delta_ms: Some(local_delta + 2.0),
+                            raw_p99_delta_ms: Some(local_delta + 4.0),
+                            jitter_p95_minus_p50_ms: Some(2.0),
+                            jitter_p99_minus_p50_ms: Some(4.0),
+                        }),
+                    },
+                ),
+                (
+                    "Corvus".to_string(),
+                    MetricsEndpointReport {
+                        endpoint_url: "http://ams.corvus-labs.io:10101".to_string(),
+                        endpoint_kind: "yellowstone".to_string(),
+                        first_detection_rate: 0.5,
+                        p50_latency_ms: Some(0.0),
+                        p95_latency_ms: Some(0.0),
+                        p99_latency_ms: Some(0.0),
+                        observations: 240,
+                        first_detections: 120,
+                        backfill_transactions: 0,
+                        yellowstone_endpoint_local: Some(YellowstoneEndpointLocalSummary {
+                            observed_signatures: 240,
+                            live_observations: 240,
+                            eligible_created_at: 240,
+                            missing_created_at: 0,
+                            zero_created_at: 0,
+                            eligible_ratio: Some(1.0),
+                            zero_created_at_rate: Some(0.0),
+                            backfill_rate: Some(0.0),
+                            raw_p50_delta_ms: Some(corvus_delta),
+                            raw_p95_delta_ms: Some(corvus_delta + 3.0),
+                            raw_p99_delta_ms: Some(corvus_delta + 7.0),
+                            jitter_p95_minus_p50_ms: Some(3.0),
+                            jitter_p99_minus_p50_ms: Some(7.0),
+                        }),
+                    },
+                ),
+            ]),
+        };
+
+        let left = build_report(10.0, 20.0);
+        let right = build_report(12.0, 23.0);
+
+        let comparisons =
+            compare_metrics_reports(&left, &right).expect("comparison should succeed");
+
+        assert_eq!(comparisons.len(), 2);
+        assert_eq!(
+            comparisons
+                .iter()
+                .map(|comparison| comparison.endpoint_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Corvus", "Local"]
+        );
     }
 }

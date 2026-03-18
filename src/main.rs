@@ -140,12 +140,14 @@ async fn main() -> Result<()> {
     if let Some((left_path, right_path)) = cli.compare_json_paths.as_ref() {
         let left_report = analysis::load_metrics_report(left_path)?;
         let right_report = analysis::load_metrics_report(right_path)?;
-        let comparison = analysis::compare_metrics_reports(&left_report, &right_report)?;
-        analysis::display_metrics_comparison(
-            &comparison,
-            display_label(left_path),
-            display_label(right_path),
-        );
+        let comparisons = analysis::compare_metrics_reports(&left_report, &right_report)?;
+        for comparison in &comparisons {
+            analysis::display_metrics_comparison(
+                comparison,
+                display_label(left_path),
+                display_label(right_path),
+            );
+        }
         return Ok(());
     }
 
