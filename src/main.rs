@@ -270,7 +270,7 @@ async fn main() -> Result<()> {
     let yellowstone_endpoint_names: Vec<String> = config
         .endpoint
         .iter()
-        .filter(|endpoint| endpoint.kind == config::EndpointKind::Yellowstone)
+        .filter(|endpoint| endpoint.kind.is_yellowstone_family())
         .map(|endpoint| endpoint.name.clone())
         .collect();
     let global_target = if config.config.transactions > 0 {

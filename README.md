@@ -69,13 +69,21 @@ name = "Local Yellowstone UDS"
 url = "unix:///var/run/geyser.sock"
 x_token = "optional-auth-token"
 kind = "yellowstone"
+
+[[endpoint]]
+name = "Local Yellowstone Deshred"
+url = "https://fra.corvus-labs.io:10101"
+x_token = "optional-auth-token"
+kind = "yellowstone_deshred"
 ```
 
 - `config.transactions` sets how many signatures to evaluate (backend streaming automatically disables itself for extremely large runs).
 - `config.account` is the list of pubkeys monitored for transactions during the benchmark. A transaction matches if it contains any listed pubkey.
 - `config.commitment` accepts `processed`, `confirmed`, or `finalized`.
-- Repeat `[[endpoint]]` blocks for each feed. Supported `kind` values: `yellowstone`, `arpc`, `thor`, `shredstream`, `shreder`, and `jetstream`. `x_token` is optional.
-- `kind = "yellowstone"` supports `http://`, `https://`, and `unix:///absolute/path.sock`. UDS does not require a new `kind`.
+- Repeat `[[endpoint]]` blocks for each feed. Supported `kind` values: `yellowstone`, `yellowstone_deshred`, `arpc`, `thor`, `shredstream`, `shreder`, and `jetstream`. `x_token` is optional.
+- `kind = "yellowstone"` and `kind = "yellowstone_deshred"` both support `http://`, `https://`, and `unix:///absolute/path.sock`. UDS does not require a new `kind`.
+- `kind = "yellowstone_deshred"` uses Yellowstone's `SubscribeDeshred` stream and participates in the same comparison and metrics output as other endpoints.
+- `config.commitment` is still recorded for the run, but Yellowstone deshred subscriptions do not send a commitment field because the upstream RPC does not accept one.
 - Bare socket paths like `/var/run/geyser.sock` are rejected; use the explicit `unix:///...` form.
 
 ## CLI Options

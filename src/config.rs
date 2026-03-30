@@ -52,6 +52,8 @@ pub struct BackendSettings {
 #[serde(rename_all = "lowercase")]
 pub enum EndpointKind {
     Yellowstone,
+    #[serde(rename = "yellowstone_deshred")]
+    YellowstoneDeshred,
     Arpc,
     Thor,
     Shredstream,
@@ -99,12 +101,20 @@ impl EndpointKind {
     pub fn as_str(&self) -> &'static str {
         match self {
             EndpointKind::Yellowstone => "yellowstone",
+            EndpointKind::YellowstoneDeshred => "yellowstone_deshred",
             EndpointKind::Arpc => "arpc",
             EndpointKind::Thor => "thor",
             EndpointKind::Shredstream => "shredstream",
             EndpointKind::Shreder => "shreder",
             EndpointKind::Jetstream => "jetstream",
         }
+    }
+
+    pub fn is_yellowstone_family(&self) -> bool {
+        matches!(
+            self,
+            EndpointKind::Yellowstone | EndpointKind::YellowstoneDeshred
+        )
     }
 }
 
@@ -159,7 +169,7 @@ impl ConfigToml {
 
     fn validate(&self) -> Result<()> {
         for endpoint in &self.endpoint {
-            if endpoint.kind == EndpointKind::Yellowstone {
+            if endpoint.kind.is_yellowstone_family() {
                 parse_yellowstone_endpoint_url(&endpoint.url).map_err(|err| {
                     anyhow!("invalid yellowstone url for '{}': {err}", endpoint.name)
                 })?;
@@ -192,7 +202,8 @@ pub fn parse_yellowstone_endpoint_url(raw: &str) -> Result<YellowstoneEndpointUr
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgsCommitment, ConfigToml, YellowstoneEndpointUrl, parse_yellowstone_endpoint_url,
+        ArgsCommitment, ConfigToml, EndpointKind, YellowstoneEndpointUrl,
+        parse_yellowstone_endpoint_url,
     };
     use crate::providers::common::WatchedAccounts;
     use std::{
@@ -355,6 +366,168 @@ kind = "yellowstone"
         assert_eq!(loaded.endpoint[0].url, "unix:///tmp/geyser.sock");
 
         fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn accepts_yellowstone_deshred_kind() {
+        let raw = r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone_deshred"
+"#;
+
+        let parsed: ConfigToml = toml::from_str(raw).expect("config should deserialize");
+
+        assert!(matches!(
+            parsed.endpoint[0].kind,
+            EndpointKind::YellowstoneDeshred
+        ));
+    }
+
+    #[test]
+    fn accepts_yellowstone_deshred_http_url() {
+        let path = write_temp_config(
+            "yellowstone-deshred-http",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone_deshred"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("http yellowstone deshred url should be accepted");
+        assert_eq!(loaded.endpoint[0].url, "http://127.0.0.1:10000");
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn accepts_yellowstone_deshred_https_url() {
+        let path = write_temp_config(
+            "yellowstone-deshred-https",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "https://example.com:443"
+kind = "yellowstone_deshred"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("https yellowstone deshred url should be accepted");
+        assert_eq!(loaded.endpoint[0].url, "https://example.com:443");
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn accepts_yellowstone_deshred_unix_url() {
+        let path = write_temp_config(
+            "yellowstone-deshred-unix",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "unix:///tmp/geyser.sock"
+kind = "yellowstone_deshred"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("unix yellowstone deshred url should be accepted");
+        assert_eq!(loaded.endpoint[0].url, "unix:///tmp/geyser.sock");
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_yellowstone_deshred_bare_socket_path() {
+        let path = write_temp_config(
+            "yellowstone-deshred-bare-socket",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "/tmp/geyser.sock"
+kind = "yellowstone_deshred"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("bare socket path should be rejected");
+        assert!(
+            err.to_string().contains(
+                "yellowstone url must use http://, https://, or unix:///absolute/path.sock"
+            )
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_yellowstone_deshred_url_with_unsupported_scheme() {
+        let path = write_temp_config(
+            "yellowstone-deshred-unsupported-scheme",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "grpc://127.0.0.1:10000"
+kind = "yellowstone_deshred"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("unsupported scheme should be rejected");
+        assert!(
+            err.to_string().contains(
+                "yellowstone url must use http://, https://, or unix:///absolute/path.sock"
+            )
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn endpoint_kind_reports_yellowstone_family_members() {
+        assert_eq!(EndpointKind::Yellowstone.as_str(), "yellowstone");
+        assert_eq!(
+            EndpointKind::YellowstoneDeshred.as_str(),
+            "yellowstone_deshred"
+        );
+        assert!(EndpointKind::Yellowstone.is_yellowstone_family());
+        assert!(EndpointKind::YellowstoneDeshred.is_yellowstone_family());
+        assert!(!EndpointKind::Arpc.is_yellowstone_family());
     }
 
     #[test]

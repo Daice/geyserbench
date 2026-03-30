@@ -1,5 +1,5 @@
 use crate::{
-    config::{Config, Endpoint, EndpointKind},
+    config::{Config, Endpoint},
     utils::{Comparator, TransactionData, percentile},
 };
 use anyhow::{Context, Result, bail};
@@ -443,7 +443,7 @@ pub fn compare_metrics_reports(
         .collect::<Vec<_>>();
 
     if shared_endpoint_names.is_empty() {
-        bail!("metrics reports do not share any comparable Yellowstone endpoint names");
+        bail!("metrics reports do not share any comparable Yellowstone-family endpoint names");
     }
 
     shared_endpoint_names.sort();
@@ -519,7 +519,7 @@ pub fn display_metrics_comparison(
     left_label: &str,
     right_label: &str,
 ) {
-    println!("\nAsync Yellowstone comparison");
+    println!("\nAsync Yellowstone-family comparison");
     println!("--------------------------------------------");
     println!("Endpoint name: {}", comparison.endpoint_name);
     println!("Endpoint URL: {}", comparison.endpoint_url);
@@ -707,7 +707,7 @@ fn compute_yellowstone_endpoint_local_summaries(
 ) -> BTreeMap<String, YellowstoneEndpointLocalSummary> {
     let yellowstone_endpoints = endpoints
         .iter()
-        .filter(|endpoint| endpoint.kind == EndpointKind::Yellowstone)
+        .filter(|endpoint| endpoint.kind.is_yellowstone_family())
         .collect::<Vec<_>>();
 
     let mut stats: HashMap<String, YellowstoneEndpointLocalStats> = yellowstone_endpoints
@@ -1086,6 +1086,15 @@ mod tests {
         }
     }
 
+    fn yellowstone_deshred_endpoint(name: &str, url: &str) -> Endpoint {
+        Endpoint {
+            name: name.to_string(),
+            url: url.to_string(),
+            x_token: None,
+            kind: EndpointKind::YellowstoneDeshred,
+        }
+    }
+
     fn yellowstone_report(
         comparator: &Comparator,
         endpoint: Endpoint,
@@ -1288,6 +1297,36 @@ mod tests {
     }
 
     #[test]
+    fn yellowstone_created_at_treats_deshred_as_family_member() {
+        let comparator = Comparator::new();
+
+        comparator.add_batch(
+            "ys-a",
+            HashMap::from([("sig-1".to_string(), tx(101.0, 100.0, 10, Some(5.0)))]),
+        );
+        comparator.add_batch(
+            "ys-deshred",
+            HashMap::from([("sig-1".to_string(), tx(101.0, 100.0, 9, Some(4.0)))]),
+        );
+        comparator.add_batch(
+            "arpc",
+            HashMap::from([("sig-1".to_string(), tx(101.0, 100.0, 12, None))]),
+        );
+
+        let summary = compute_run_summary(
+            &comparator,
+            &names(&["ys-a", "ys-deshred", "arpc"]),
+            &names(&["ys-a", "ys-deshred"]),
+        );
+        let yellowstone = summary
+            .yellowstone_created_at
+            .expect("yellowstone summary should exist");
+
+        assert_eq!(yellowstone.eligible_signatures, 1);
+        assert_eq!(yellowstone.endpoints.len(), 2);
+    }
+
+    #[test]
     fn zero_created_at_is_classified_but_not_counted_in_latency_distribution() {
         let comparator = Comparator::new();
 
@@ -1452,6 +1491,29 @@ mod tests {
         assert_eq!(report.run_finished_at_unix_ms, 456_000.0);
         assert_eq!(endpoint.endpoint_url, "https://example.com");
         assert_eq!(endpoint.endpoint_kind, "yellowstone");
+    }
+
+    #[test]
+    fn metrics_report_contains_deshred_local_summary() {
+        let comparator = Comparator::new();
+        comparator.add_batch(
+            "ys-deshred",
+            HashMap::from([("sig-1".to_string(), tx(101.0, 100.0, 10, Some(5.0)))]),
+        );
+
+        let report = yellowstone_report(
+            &comparator,
+            yellowstone_deshred_endpoint("ys-deshred", "https://example.com"),
+            123.0,
+            456.0,
+        );
+        let endpoint = report
+            .per_endpoint
+            .get("ys-deshred")
+            .expect("endpoint should exist");
+
+        assert_eq!(endpoint.endpoint_kind, "yellowstone_deshred");
+        assert!(endpoint.yellowstone_endpoint_local.is_some());
     }
 
     #[test]
@@ -1667,5 +1729,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["Corvus", "Local"]
         );
+    }
+
+    #[test]
+    fn compare_supports_yellowstone_deshred_endpoints() {
+        let build_report = |delta: f64| MetricsReport {
+            account: vec!["11111111111111111111111111111111".to_string()],
+            commitment: "processed".to_string(),
+            run_started_at_unix_ms: 1_000.0,
+            run_finished_at_unix_ms: 2_000.0,
+            total_signatures: 240,
+            backfill_signatures: 0,
+            yellowstone_created_at: None,
+            per_endpoint: BTreeMap::from([(
+                "Local Deshred".to_string(),
+                MetricsEndpointReport {
+                    endpoint_url: "http://127.0.0.1:10003".to_string(),
+                    endpoint_kind: "yellowstone_deshred".to_string(),
+                    first_detection_rate: 0.5,
+                    p50_latency_ms: Some(0.0),
+                    p95_latency_ms: Some(0.0),
+                    p99_latency_ms: Some(0.0),
+                    observations: 240,
+                    first_detections: 120,
+                    backfill_transactions: 0,
+                    yellowstone_endpoint_local: Some(YellowstoneEndpointLocalSummary {
+                        observed_signatures: 240,
+                        live_observations: 240,
+                        eligible_created_at: 240,
+                        missing_created_at: 0,
+                        zero_created_at: 0,
+                        eligible_ratio: Some(1.0),
+                        zero_created_at_rate: Some(0.0),
+                        backfill_rate: Some(0.0),
+                        raw_p50_delta_ms: Some(delta),
+                        raw_p95_delta_ms: Some(delta + 2.0),
+                        raw_p99_delta_ms: Some(delta + 4.0),
+                        jitter_p95_minus_p50_ms: Some(2.0),
+                        jitter_p99_minus_p50_ms: Some(4.0),
+                    }),
+                },
+            )]),
+        };
+
+        let mut comparisons = compare_metrics_reports(&build_report(10.0), &build_report(12.0))
+            .expect("comparison should succeed");
+        let comparison = comparisons.pop().expect("single comparison should exist");
+
+        assert_eq!(comparison.endpoint_name, "Local Deshred");
+        assert_eq!(comparison.endpoint_kind, "yellowstone_deshred");
     }
 }

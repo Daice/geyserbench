@@ -20,7 +20,10 @@ use tokio::net::UnixStream;
 #[cfg(unix)]
 use tonic::transport::Uri;
 
-use crate::proto::geyser::{SubscribeRequest, SubscribeUpdate, geyser_client::GeyserClient};
+use crate::proto::geyser::{
+    SubscribeDeshredRequest, SubscribeRequest, SubscribeUpdate, SubscribeUpdateDeshred,
+    geyser_client::GeyserClient,
+};
 
 #[derive(Clone, Debug)]
 pub struct InterceptorXToken {
@@ -86,6 +89,34 @@ impl GeyserGrpcClient {
         }
         let response: Response<Streaming<SubscribeUpdate>> =
             self.geyser.subscribe(subscribe_rx).await?;
+        Ok((subscribe_tx, response.into_inner()))
+    }
+
+    pub async fn subscribe_deshred(
+        &mut self,
+    ) -> GeyserGrpcClientResult<(
+        impl Sink<SubscribeDeshredRequest, Error = mpsc::SendError>,
+        impl Stream<Item = Result<SubscribeUpdateDeshred, Status>>,
+    )> {
+        self.subscribe_deshred_with_request(None).await
+    }
+
+    pub async fn subscribe_deshred_with_request(
+        &mut self,
+        request: Option<SubscribeDeshredRequest>,
+    ) -> GeyserGrpcClientResult<(
+        impl Sink<SubscribeDeshredRequest, Error = mpsc::SendError>,
+        impl Stream<Item = Result<SubscribeUpdateDeshred, Status>>,
+    )> {
+        let (mut subscribe_tx, subscribe_rx) = mpsc::unbounded();
+        if let Some(request) = request {
+            subscribe_tx
+                .send(request)
+                .await
+                .map_err(GeyserGrpcClientError::SubscribeSendError)?;
+        }
+        let response: Response<Streaming<SubscribeUpdateDeshred>> =
+            self.geyser.subscribe_deshred(subscribe_rx).await?;
         Ok((subscribe_tx, response.into_inner()))
     }
 

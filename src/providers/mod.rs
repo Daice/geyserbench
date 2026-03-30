@@ -36,6 +36,7 @@ pub trait GeyserProvider: Send + Sync {
 pub fn create_provider(kind: &EndpointKind) -> Box<dyn GeyserProvider> {
     match kind {
         EndpointKind::Yellowstone => Box::new(yellowstone::YellowstoneProvider),
+        EndpointKind::YellowstoneDeshred => Box::new(yellowstone::YellowstoneDeshredProvider),
         EndpointKind::Arpc => Box::new(arpc::ArpcProvider),
         EndpointKind::Thor => Box::new(thor::ThorProvider),
         EndpointKind::Shreder => Box::new(shreder::ShrederProvider),

@@ -36,3 +36,9 @@ kind = "yellowstone"
 name = "Corvus"
 url = "http://ams.corvus-labs.io:10101"
 kind = "yellowstone"
+
+[[endpoint]]
+name = "Local Deshred"
+url = "http://127.0.0.1:10003"
+kind = "yellowstone_deshred"
+# x_token = "optional-auth-token"
