@@ -63,12 +63,20 @@ name = "Corvus gRPC"
 url = "https://fra.corvus-labs.io:10101"
 x_token = "optional-auth-token"
 kind = "yellowstone"
+
+[[endpoint]]
+name = "Local Yellowstone UDS"
+url = "unix:///var/run/geyser.sock"
+x_token = "optional-auth-token"
+kind = "yellowstone"
 ```
 
 - `config.transactions` sets how many signatures to evaluate (backend streaming automatically disables itself for extremely large runs).
 - `config.account` is the list of pubkeys monitored for transactions during the benchmark. A transaction matches if it contains any listed pubkey.
 - `config.commitment` accepts `processed`, `confirmed`, or `finalized`.
 - Repeat `[[endpoint]]` blocks for each feed. Supported `kind` values: `yellowstone`, `arpc`, `thor`, `shredstream`, `shreder`, and `jetstream`. `x_token` is optional.
+- `kind = "yellowstone"` supports `http://`, `https://`, and `unix:///absolute/path.sock`. UDS does not require a new `kind`.
+- Bare socket paths like `/var/run/geyser.sock` are rejected; use the explicit `unix:///...` form.
 
 ## CLI Options
 

@@ -1,7 +1,16 @@
 use crate::proto::geyser::CommitmentLevel;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+use url::Url;
+
+const YELLOWSTONE_URL_ERROR: &str =
+    "yellowstone url must use http://, https://, or unix:///absolute/path.sock";
+const YELLOWSTONE_UNIX_PATH_ERROR: &str =
+    "yellowstone unix url must include an absolute socket path";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigToml {
@@ -59,6 +68,13 @@ pub enum ArgsCommitment {
     Finalized,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum YellowstoneEndpointUrl {
+    Http,
+    Https,
+    Unix(PathBuf),
+}
+
 impl From<ArgsCommitment> for CommitmentLevel {
     fn from(commitment: ArgsCommitment) -> Self {
         match commitment {
@@ -96,7 +112,8 @@ impl ConfigToml {
     pub fn load(path: &str) -> Result<Self> {
         let content =
             fs::read_to_string(path).with_context(|| format!("Failed to read config {}", path))?;
-        let config = toml::from_str(&content).map_err(|err| anyhow!(err))?;
+        let config: Self = toml::from_str(&content).map_err(|err| anyhow!(err))?;
+        config.validate()?;
         Ok(config)
     }
 
@@ -139,11 +156,44 @@ impl ConfigToml {
             Self::create_default(path)
         }
     }
+
+    fn validate(&self) -> Result<()> {
+        for endpoint in &self.endpoint {
+            if endpoint.kind == EndpointKind::Yellowstone {
+                parse_yellowstone_endpoint_url(&endpoint.url).map_err(|err| {
+                    anyhow!("invalid yellowstone url for '{}': {err}", endpoint.name)
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub fn parse_yellowstone_endpoint_url(raw: &str) -> Result<YellowstoneEndpointUrl> {
+    if let Some(path) = raw.strip_prefix("unix://") {
+        if path.is_empty() || !path.starts_with('/') {
+            bail!(YELLOWSTONE_UNIX_PATH_ERROR);
+        }
+        return Ok(YellowstoneEndpointUrl::Unix(PathBuf::from(path)));
+    }
+
+    let parsed = Url::parse(raw).map_err(|_| anyhow!(YELLOWSTONE_URL_ERROR))?;
+    if parsed.host_str().is_none() {
+        bail!(YELLOWSTONE_URL_ERROR);
+    }
+
+    match parsed.scheme() {
+        "http" => Ok(YellowstoneEndpointUrl::Http),
+        "https" => Ok(YellowstoneEndpointUrl::Https),
+        _ => bail!(YELLOWSTONE_URL_ERROR),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgsCommitment, ConfigToml};
+    use super::{
+        ArgsCommitment, ConfigToml, YellowstoneEndpointUrl, parse_yellowstone_endpoint_url,
+    };
     use crate::providers::common::WatchedAccounts;
     use std::{
         env, fs,
@@ -157,6 +207,12 @@ mod tests {
             .expect("system time before unix epoch")
             .as_nanos();
         env::temp_dir().join(format!("geyserbench-{prefix}-{unique}.toml"))
+    }
+
+    fn write_temp_config(prefix: &str, raw: &str) -> PathBuf {
+        let path = temp_config_path(prefix);
+        fs::write(&path, raw).expect("temporary config should be written");
+        path
     }
 
     #[test]
@@ -227,5 +283,184 @@ kind = "yellowstone"
 
         assert!(err.to_string().contains("config.account[0]"));
         assert!(err.to_string().contains("not-a-pubkey"));
+    }
+
+    #[test]
+    fn accepts_yellowstone_http_url() {
+        let path = write_temp_config(
+            "yellowstone-http",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("http yellowstone url should be accepted");
+        assert_eq!(loaded.endpoint[0].url, "http://127.0.0.1:10000");
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn accepts_yellowstone_https_url() {
+        let path = write_temp_config(
+            "yellowstone-https",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "https://example.com:443"
+kind = "yellowstone"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("https yellowstone url should be accepted");
+        assert_eq!(loaded.endpoint[0].url, "https://example.com:443");
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn accepts_yellowstone_unix_url() {
+        let path = write_temp_config(
+            "yellowstone-unix",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "unix:///tmp/geyser.sock"
+kind = "yellowstone"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("unix yellowstone url should be accepted");
+        assert_eq!(loaded.endpoint[0].url, "unix:///tmp/geyser.sock");
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_yellowstone_bare_socket_path() {
+        let path = write_temp_config(
+            "yellowstone-bare-socket",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "/tmp/geyser.sock"
+kind = "yellowstone"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("bare socket path should be rejected");
+        assert!(
+            err.to_string().contains(
+                "yellowstone url must use http://, https://, or unix:///absolute/path.sock"
+            )
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_yellowstone_url_with_unsupported_scheme() {
+        let path = write_temp_config(
+            "yellowstone-unsupported-scheme",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "grpc://127.0.0.1:10000"
+kind = "yellowstone"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("unsupported scheme should be rejected");
+        assert!(
+            err.to_string().contains(
+                "yellowstone url must use http://, https://, or unix:///absolute/path.sock"
+            )
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_yellowstone_unix_url_without_path() {
+        let path = write_temp_config(
+            "yellowstone-empty-unix",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "unix://"
+kind = "yellowstone"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("unix url without path should be rejected");
+        assert!(
+            err.to_string()
+                .contains("yellowstone unix url must include an absolute socket path")
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn parses_yellowstone_http_url() {
+        let parsed = parse_yellowstone_endpoint_url("http://127.0.0.1:10000")
+            .expect("http url should parse");
+        assert_eq!(parsed, YellowstoneEndpointUrl::Http);
+    }
+
+    #[test]
+    fn parses_yellowstone_https_url() {
+        let parsed = parse_yellowstone_endpoint_url("https://example.com:443")
+            .expect("https url should parse");
+        assert_eq!(parsed, YellowstoneEndpointUrl::Https);
+    }
+
+    #[test]
+    fn parses_yellowstone_unix_url() {
+        let parsed = parse_yellowstone_endpoint_url("unix:///tmp/geyser.sock")
+            .expect("unix url should parse");
+        assert_eq!(
+            parsed,
+            YellowstoneEndpointUrl::Unix(PathBuf::from("/tmp/geyser.sock"))
+        );
     }
 }

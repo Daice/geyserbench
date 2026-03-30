@@ -11,7 +11,7 @@ use crate::proto::geyser::{
 };
 
 use crate::{
-    config::{Config, Endpoint},
+    config::{Config, Endpoint, YellowstoneEndpointUrl, parse_yellowstone_endpoint_url},
     utils::{
         TransactionData, get_current_timestamp, open_log_file, protobuf_timestamp_to_unix_ms,
         write_log_entry,
@@ -74,11 +74,18 @@ async fn process_yellowstone_endpoint(
         .x_token
         .clone()
         .filter(|token| !token.trim().is_empty());
+    let endpoint_transport = parse_yellowstone_endpoint_url(&endpoint_url)
+        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
 
     info!(endpoint = %endpoint_name, url = %endpoint_url, "Connecting");
 
-    let builder = GeyserGrpcClient::build_from_shared(endpoint_url.clone())
-        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
+    let builder = match &endpoint_transport {
+        YellowstoneEndpointUrl::Http | YellowstoneEndpointUrl::Https => {
+            GeyserGrpcClient::build_from_shared(endpoint_url.clone())
+                .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err))
+        }
+        YellowstoneEndpointUrl::Unix(_) => GeyserGrpcClient::build_from_static("http://[::]:0"),
+    };
     let builder = if let Some(token) = endpoint_token {
         builder
             .x_token(Some(token))
@@ -86,13 +93,23 @@ async fn process_yellowstone_endpoint(
     } else {
         builder
     };
-    let builder = builder
-        .tls_config(ClientTlsConfig::new().with_native_roots())
-        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
-    let mut client = builder
-        .connect()
-        .await
-        .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err));
+    let builder = if matches!(endpoint_transport, YellowstoneEndpointUrl::Https) {
+        builder
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err))
+    } else {
+        builder
+    };
+    let mut client = match endpoint_transport {
+        YellowstoneEndpointUrl::Http | YellowstoneEndpointUrl::Https => builder
+            .connect()
+            .await
+            .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err)),
+        YellowstoneEndpointUrl::Unix(path) => builder
+            .connect_uds(path)
+            .await
+            .unwrap_or_else(|err| fatal_connection_error(&endpoint_name, err)),
+    };
 
     info!(endpoint = %endpoint_name, "Connected");
 

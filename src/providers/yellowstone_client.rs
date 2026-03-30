@@ -5,7 +5,7 @@ use {
         sink::{Sink, SinkExt},
         stream::Stream,
     },
-    std::convert::TryInto,
+    std::{convert::TryInto, path::PathBuf},
     tonic::{
         Request, Response, Status,
         codec::Streaming,
@@ -14,6 +14,11 @@ use {
         transport::{ClientTlsConfig, Endpoint, channel::Channel},
     },
 };
+
+#[cfg(unix)]
+use tokio::net::UnixStream;
+#[cfg(unix)]
+use tonic::transport::Uri;
 
 use crate::proto::geyser::{SubscribeRequest, SubscribeUpdate, geyser_client::GeyserClient};
 
@@ -50,6 +55,10 @@ impl GeyserGrpcClient {
         endpoint: impl Into<Bytes>,
     ) -> GeyserGrpcBuilderResult<GeyserGrpcBuilder> {
         Ok(GeyserGrpcBuilder::new(Endpoint::from_shared(endpoint)?))
+    }
+
+    pub fn build_from_static(endpoint: &'static str) -> GeyserGrpcBuilder {
+        GeyserGrpcBuilder::new(Endpoint::from_static(endpoint))
     }
 
     pub async fn subscribe(
@@ -91,6 +100,9 @@ pub enum GeyserGrpcBuilderError {
     MetadataValueError(#[from] InvalidMetadataValue),
     #[error("gRPC transport error: {0}")]
     TonicError(#[from] tonic::transport::Error),
+    #[cfg(not(unix))]
+    #[error("Unix domain sockets are only supported on unix platforms")]
+    UnsupportedUdsPlatform,
 }
 
 pub type GeyserGrpcBuilderResult<T> = Result<T, GeyserGrpcBuilderError>;
@@ -113,6 +125,33 @@ impl GeyserGrpcBuilder {
         self.build(channel)
     }
 
+    #[cfg(unix)]
+    pub async fn connect_uds(
+        self,
+        path: impl Into<PathBuf>,
+    ) -> GeyserGrpcBuilderResult<GeyserGrpcClient> {
+        let path = path.into();
+        let channel = Endpoint::from_static("http://[::]:0")
+            .connect_with_connector(tower::service_fn(move |_: Uri| {
+                let path = path.clone();
+                async move {
+                    let stream = UnixStream::connect(path).await?;
+                    Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                }
+            }))
+            .await?;
+        self.build(channel)
+    }
+
+    #[cfg(not(unix))]
+    pub async fn connect_uds(
+        self,
+        _path: impl Into<PathBuf>,
+    ) -> GeyserGrpcBuilderResult<GeyserGrpcClient> {
+        let _ = self;
+        Err(GeyserGrpcBuilderError::UnsupportedUdsPlatform)
+    }
+
     fn build(self, channel: Channel) -> GeyserGrpcBuilderResult<GeyserGrpcClient> {
         let interceptor = InterceptorXToken {
             x_token: self.x_token,
@@ -132,5 +171,31 @@ impl GeyserGrpcBuilder {
     pub fn tls_config(mut self, tls_config: ClientTlsConfig) -> GeyserGrpcBuilderResult<Self> {
         self.endpoint = self.endpoint.tls_config(tls_config)?;
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GeyserGrpcClient;
+
+    #[test]
+    fn test_channel_http_success() {
+        let endpoint = "http://127.0.0.1:10000";
+        let x_token = "1234567891012141618202224268";
+
+        let res = GeyserGrpcClient::build_from_shared(endpoint);
+        assert!(res.is_ok());
+
+        let res = res.unwrap().x_token(Some(x_token));
+        assert!(res.is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_channel_uds_missing_socket_returns_error() {
+        let res = GeyserGrpcClient::build_from_static("http://[::]:0")
+            .connect_uds("/tmp/geyserbench-missing-yellowstone.sock")
+            .await;
+        assert!(res.is_err());
     }
 }
