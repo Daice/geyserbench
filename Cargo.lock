@@ -1373,6 +1373,7 @@ dependencies = [
  "serde_json",
  "solana-entry",
  "solana-pubkey",
+ "solana-transaction",
  "thiserror 1.0.69",
  "thorstreamer-grpc-client",
  "tokio",

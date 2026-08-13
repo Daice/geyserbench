@@ -2,6 +2,7 @@ use crate::proto::geyser::CommitmentLevel;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -11,6 +12,7 @@ const YELLOWSTONE_URL_ERROR: &str =
     "yellowstone url must use http://, https://, or unix:///absolute/path.sock";
 const YELLOWSTONE_UNIX_PATH_ERROR: &str =
     "yellowstone unix url must include an absolute socket path";
+pub const HELIUS_PRECONF_HOST: &str = "beta.helius-rpc.com";
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ConfigToml {
@@ -33,6 +35,8 @@ pub struct Endpoint {
     pub url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub x_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub region_include: Vec<HeliusPreconfRegion>,
     pub kind: EndpointKind,
 }
 
@@ -59,6 +63,27 @@ pub enum EndpointKind {
     Shredstream,
     Shreder,
     Jetstream,
+    #[serde(rename = "helius_preconf")]
+    HeliusPreconf,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum HeliusPreconfRegion {
+    Slc,
+    Fra,
+    Lon,
+    Pit,
+    Sgp,
+    Ewr,
+    Tyo,
+    Ams,
+    Dal,
+    Dub,
+    Mia,
+    Lax,
+    Iad,
+    Sea,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize)]
@@ -107,6 +132,7 @@ impl EndpointKind {
             EndpointKind::Shredstream => "shredstream",
             EndpointKind::Shreder => "shreder",
             EndpointKind::Jetstream => "jetstream",
+            EndpointKind::HeliusPreconf => "helius_preconf",
         }
     }
 
@@ -116,13 +142,20 @@ impl EndpointKind {
             EndpointKind::Yellowstone | EndpointKind::YellowstoneDeshred
         )
     }
+
+    pub fn is_preconf(&self) -> bool {
+        matches!(self, EndpointKind::HeliusPreconf)
+    }
 }
 
 impl ConfigToml {
     pub fn load(path: &str) -> Result<Self> {
         let content =
             fs::read_to_string(path).with_context(|| format!("Failed to read config {}", path))?;
-        let config: Self = toml::from_str(&content).map_err(|err| anyhow!(err))?;
+        let config: Self = toml::from_str(&content).map_err(|mut err| {
+            err.set_input(None);
+            anyhow!(err)
+        })?;
         config.validate()?;
         Ok(config)
     }
@@ -139,12 +172,14 @@ impl ConfigToml {
                     name: "grpc".to_string(),
                     url: "http://fra.corvus-labs.io:10101".to_string(),
                     x_token: None,
+                    region_include: Vec::new(),
                     kind: EndpointKind::Yellowstone,
                 },
                 Endpoint {
                     name: "arpc".to_string(),
                     url: "http://fra.corvus-labs.io:20202".to_string(),
                     x_token: None,
+                    region_include: Vec::new(),
                     kind: EndpointKind::Arpc,
                 },
             ],
@@ -168,11 +203,92 @@ impl ConfigToml {
     }
 
     fn validate(&self) -> Result<()> {
+        let mut endpoint_names = HashSet::new();
+        for endpoint in &self.endpoint {
+            if !endpoint_names.insert(endpoint.name.as_str()) {
+                bail!("duplicate endpoint name '{}'", endpoint.name);
+            }
+        }
+
+        let preconf_endpoints = self
+            .endpoint
+            .iter()
+            .filter(|endpoint| endpoint.kind.is_preconf())
+            .collect::<Vec<_>>();
+        if preconf_endpoints.len() > 1 {
+            bail!("at most one kind='helius_preconf' endpoint is supported");
+        }
+        if !preconf_endpoints.is_empty()
+            && !self
+                .endpoint
+                .iter()
+                .any(|endpoint| !endpoint.kind.is_preconf())
+        {
+            bail!("at least one non-preconf [[endpoint]] entry is required");
+        }
+
         for endpoint in &self.endpoint {
             if endpoint.kind.is_yellowstone_family() {
                 parse_yellowstone_endpoint_url(&endpoint.url).map_err(|err| {
                     anyhow!("invalid yellowstone url for '{}': {err}", endpoint.name)
                 })?;
+            }
+            if !endpoint.kind.is_preconf() && !endpoint.region_include.is_empty() {
+                bail!(
+                    "endpoint '{}' may only set region_include when kind='helius_preconf'",
+                    endpoint.name
+                );
+            }
+        }
+
+        if let Some(endpoint) = preconf_endpoints.first() {
+            if self.config.account.is_empty() {
+                bail!(
+                    "Helius preconfSubscribe requires at least one config.account entry to avoid an unfiltered stream"
+                );
+            }
+            if self.config.account.len() > 500 {
+                bail!("Helius preconfSubscribe supports at most 500 config.account entries");
+            }
+            for (index, account) in self.config.account.iter().enumerate() {
+                account.parse::<solana_pubkey::Pubkey>().with_context(|| {
+                    format!("invalid pubkey in config.account[{index}]: {account}")
+                })?;
+            }
+
+            let url = Url::parse(&endpoint.url).with_context(|| {
+                format!(
+                    "invalid URL for Helius preconf endpoint '{}'",
+                    endpoint.name
+                )
+            })?;
+            if url.scheme() != "wss" {
+                bail!(
+                    "Helius preconf endpoint '{}' must use wss://",
+                    endpoint.name
+                );
+            }
+            if url.host_str() != Some(HELIUS_PRECONF_HOST)
+                || url.port().is_some_and(|port| port != 443)
+            {
+                bail!(
+                    "Helius preconf endpoint '{}' must use the official wss://{HELIUS_PRECONF_HOST}/ endpoint",
+                    endpoint.name
+                );
+            }
+
+            let has_query_api_key = url
+                .query_pairs()
+                .any(|(key, value)| key == "api-key" && !value.trim().is_empty());
+            let has_token_api_key = endpoint
+                .x_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty());
+            if !has_query_api_key && !has_token_api_key {
+                bail!(
+                    "Helius preconf endpoint '{}' requires an API key in x_token or the api-key URL query parameter",
+                    endpoint.name
+                );
             }
         }
         Ok(())
@@ -202,7 +318,7 @@ pub fn parse_yellowstone_endpoint_url(raw: &str) -> Result<YellowstoneEndpointUr
 #[cfg(test)]
 mod tests {
     use super::{
-        ArgsCommitment, ConfigToml, EndpointKind, YellowstoneEndpointUrl,
+        ArgsCommitment, ConfigToml, EndpointKind, HeliusPreconfRegion, YellowstoneEndpointUrl,
         parse_yellowstone_endpoint_url,
     };
     use crate::providers::common::WatchedAccounts;
@@ -391,6 +507,211 @@ kind = "yellowstone_deshred"
     }
 
     #[test]
+    fn accepts_authenticated_helius_preconf_with_regions() {
+        let path = write_temp_config(
+            "helius-preconf",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone"
+
+[[endpoint]]
+name = "preconf"
+url = "wss://beta.helius-rpc.com/"
+x_token = "test-api-key"
+region_include = ["sgp", "tyo"]
+kind = "helius_preconf"
+"#,
+        );
+
+        let loaded = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect("Helius preconf config should be accepted");
+        assert_eq!(loaded.endpoint[1].kind, EndpointKind::HeliusPreconf);
+        assert_eq!(
+            loaded.endpoint[1].region_include,
+            vec![HeliusPreconfRegion::Sgp, HeliusPreconfRegion::Tyo]
+        );
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_helius_preconf_without_api_key() {
+        let path = write_temp_config(
+            "helius-preconf-no-key",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone"
+
+[[endpoint]]
+name = "preconf"
+url = "wss://beta.helius-rpc.com/"
+kind = "helius_preconf"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("missing API key should be rejected");
+        assert!(err.to_string().contains("requires an API key"));
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_unfiltered_helius_preconf_subscription() {
+        let path = write_temp_config(
+            "helius-preconf-empty-accounts",
+            r#"
+[config]
+transactions = 1000
+account = []
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone"
+
+[[endpoint]]
+name = "preconf"
+url = "wss://beta.helius-rpc.com/"
+x_token = "test-api-key"
+kind = "helius_preconf"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("empty account filter should be rejected");
+        assert!(err.to_string().contains("at least one config.account"));
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_invalid_helius_preconf_account_before_connecting() {
+        let path = write_temp_config(
+            "helius-preconf-invalid-account",
+            r#"
+[config]
+transactions = 1000
+account = ["not-a-pubkey"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone"
+
+[[endpoint]]
+name = "preconf"
+url = "wss://beta.helius-rpc.com/"
+x_token = "test-api-key"
+kind = "helius_preconf"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("invalid account should be rejected before subscribing");
+        assert!(err.to_string().contains("config.account[0]"));
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_preconf_region_on_non_preconf_endpoint() {
+        let path = write_temp_config(
+            "non-preconf-region",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "grpc"
+url = "http://127.0.0.1:10000"
+region_include = ["sgp"]
+kind = "yellowstone"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("region filter on a non-preconf endpoint should be rejected");
+        assert!(err.to_string().contains("may only set region_include"));
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn config_parse_errors_do_not_echo_api_keys() {
+        let path = write_temp_config(
+            "secret-redaction",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "preconf"
+url = "wss://beta.helius-rpc.com/"
+x_token = "sentinel-secret-must-not-leak"
+region_include = ["not-a-region"]
+kind = "helius_preconf"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("invalid region should fail parsing")
+            .to_string();
+        assert!(!err.contains("sentinel-secret-must-not-leak"));
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
+    fn rejects_duplicate_endpoint_names() {
+        let path = write_temp_config(
+            "duplicate-endpoint-name",
+            r#"
+[config]
+transactions = 1000
+account = ["11111111111111111111111111111111"]
+commitment = "processed"
+
+[[endpoint]]
+name = "duplicate"
+url = "http://127.0.0.1:10000"
+kind = "yellowstone"
+
+[[endpoint]]
+name = "duplicate"
+url = "http://127.0.0.1:20000"
+kind = "arpc"
+"#,
+        );
+
+        let err = ConfigToml::load(path.to_str().expect("utf-8 temp path"))
+            .expect_err("duplicate endpoint names should fail validation");
+        assert!(err.to_string().contains("duplicate endpoint name"));
+
+        fs::remove_file(path).expect("temporary config should be removed");
+    }
+
+    #[test]
     fn accepts_yellowstone_deshred_http_url() {
         let path = write_temp_config(
             "yellowstone-deshred-http",
@@ -525,9 +846,11 @@ kind = "yellowstone_deshred"
             EndpointKind::YellowstoneDeshred.as_str(),
             "yellowstone_deshred"
         );
+        assert_eq!(EndpointKind::HeliusPreconf.as_str(), "helius_preconf");
         assert!(EndpointKind::Yellowstone.is_yellowstone_family());
         assert!(EndpointKind::YellowstoneDeshred.is_yellowstone_family());
         assert!(!EndpointKind::Arpc.is_yellowstone_family());
+        assert!(EndpointKind::HeliusPreconf.is_preconf());
     }
 
     #[test]

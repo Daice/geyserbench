@@ -27,7 +27,9 @@ use anyhow::{Result, anyhow};
 use backend::{BackendStatus, StreamOptions};
 use crossbeam_queue::ArrayQueue;
 use tracing::{debug, error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    EnvFilter, Layer, filter::filter_fn, layer::SubscriberExt, util::SubscriberInitExt,
+};
 use utils::{Comparator, ProgressTracker, get_current_timestamp};
 const DEFAULT_CONFIG_PATH: &str = "config.toml";
 const DEFAULT_BACKEND_STREAM_URL: &str = "wss://gb.solstack.app/v1/benchmarks/stream";
@@ -129,12 +131,17 @@ fn display_label(path: &str) -> &str {
 #[tokio::main]
 async fn main() -> Result<()> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .compact()
+        .with_filter(filter_fn(|metadata| {
+            !is_sensitive_dependency_log_target(metadata.target())
+        }));
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer)
         .try_init()
-        .map_err(|err| anyhow!(err))?;
+        .map_err(|err| anyhow!(err.to_string()))?;
 
     let cli = CliArgs::parse();
     if let Some((left_path, right_path)) = cli.compare_json_paths.as_ref() {
@@ -155,11 +162,23 @@ async fn main() -> Result<()> {
     let config = config::ConfigToml::load_or_create(config_path)?;
     info!(config_path = config_path, "Loaded configuration");
     let metrics_json_stdout = cli.metrics_json_path.as_deref() == Some("-");
+    let primary_endpoints = config
+        .endpoint
+        .iter()
+        .filter(|endpoint| !endpoint.kind.is_preconf())
+        .cloned()
+        .collect::<Vec<_>>();
+    let preconf_endpoint = config
+        .endpoint
+        .iter()
+        .find(|endpoint| endpoint.kind.is_preconf())
+        .cloned();
 
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     let start_time_local = get_current_timestamp();
     let comparator = Arc::new(Comparator::new());
+    let preconf_comparator = Arc::new(Comparator::new());
     let start_instant = Instant::now();
     let clock_offset_ms: f64;
     let server_started_at_unix_ms: Option<i64>;
@@ -192,7 +211,7 @@ async fn main() -> Result<()> {
             .clone()
             .ok_or_else(|| anyhow!("backend streaming enabled but no URL configured"))?;
         let options = StreamOptions { url, summary: None };
-        let handle = backend::connect_stream(options, &config.config, &config.endpoint).await?;
+        let handle = backend::connect_stream(options, &config.config, &primary_endpoints).await?;
         clock_offset_ms = handle.clock_offset_ms();
         server_started_at_unix_ms = handle.server_started_at_unix_ms();
         let run_id = handle.run_id().to_string();
@@ -204,8 +223,8 @@ async fn main() -> Result<()> {
         );
         backend_run_id = Some(run_id.clone());
 
-        let mut queues = Vec::with_capacity(config.endpoint.len());
-        for _ in 0..config.endpoint.len() {
+        let mut queues = Vec::with_capacity(primary_endpoints.len());
+        for _ in 0..primary_endpoints.len() {
             queues.push(Arc::new(ArrayQueue::new(SIGNATURE_QUEUE_CAPACITY)));
         }
         let queue_handles = queues.iter().map(Arc::clone).collect::<Vec<_>>();
@@ -266,7 +285,10 @@ async fn main() -> Result<()> {
     }
 
     let mut handles = Vec::new();
-    let endpoint_names: Vec<String> = config.endpoint.iter().map(|e| e.name.clone()).collect();
+    let endpoint_names: Vec<String> = primary_endpoints
+        .iter()
+        .map(|endpoint| endpoint.name.clone())
+        .collect();
     let yellowstone_endpoint_names: Vec<String> = config
         .endpoint
         .iter()
@@ -280,19 +302,35 @@ async fn main() -> Result<()> {
     };
     let progress_tracker = global_target.map(|target| Arc::new(ProgressTracker::new(target)));
 
-    let total_producers = config.endpoint.len();
-    for (index, endpoint) in config.endpoint.clone().into_iter().enumerate() {
+    let total_producers = primary_endpoints.len();
+    let mut primary_index = 0usize;
+    let endpoints_to_spawn = preconf_endpoint
+        .iter()
+        .cloned()
+        .chain(primary_endpoints.iter().cloned());
+    for endpoint in endpoints_to_spawn {
         let provider = providers::create_provider(&endpoint.kind);
         let shared_config = config.config.clone();
-        let signature_queue = signature_queues
-            .as_ref()
-            .and_then(|queues| queues.get(index).cloned());
+        let is_preconf = endpoint.kind.is_preconf();
+        let signature_queue = if is_preconf {
+            None
+        } else {
+            let queue = signature_queues
+                .as_ref()
+                .and_then(|queues| queues.get(primary_index).cloned());
+            primary_index += 1;
+            queue
+        };
         let context = providers::ProviderContext {
             shutdown_tx: shutdown_tx.clone(),
             shutdown_rx: shutdown_tx.subscribe(),
             start_wallclock_secs: start_time_local,
             start_instant,
-            comparator: comparator.clone(),
+            comparator: if is_preconf {
+                preconf_comparator.clone()
+            } else {
+                comparator.clone()
+            },
             signature_tx: signature_queue,
             shared_counter: shared_counter.clone(),
             shared_shutdown: shared_shutdown.clone(),
@@ -301,7 +339,10 @@ async fn main() -> Result<()> {
             progress: progress_tracker.clone(),
         };
 
-        handles.push(provider.process(endpoint, shared_config, context));
+        handles.push((
+            is_preconf,
+            provider.process(endpoint, shared_config, context),
+        ));
     }
 
     tokio::spawn({
@@ -325,22 +366,47 @@ async fn main() -> Result<()> {
         }
     });
 
-    for handle in handles {
+    let mut preconf_failure = None;
+    for (is_preconf, handle) in handles {
         match handle.await {
             Ok(Ok(_)) => {}
-            Ok(Err(e)) => error!(error = ?e, "Provider task returned error"),
-            Err(e) => error!(error = ?e, "Provider join error"),
+            Ok(Err(e)) => {
+                error!(error = ?e, "Provider task returned error");
+                if is_preconf {
+                    preconf_failure = Some(e.to_string());
+                }
+            }
+            Err(e) => {
+                error!(error = ?e, "Provider join error");
+                if is_preconf {
+                    preconf_failure = Some(e.to_string());
+                }
+            }
         }
     }
 
-    let run_aborted = aborted.load(Ordering::Acquire);
+    let preconf_not_ready = preconf_endpoint.is_some() && !preconf_comparator.is_ready();
+    if preconf_not_ready && preconf_failure.is_none() && !aborted.load(Ordering::Acquire) {
+        error!("Helius preconf subscription was not acknowledged before the run ended");
+    }
+    let run_aborted =
+        aborted.load(Ordering::Acquire) || preconf_failure.is_some() || preconf_not_ready;
 
     let run_summary = if !run_aborted {
-        Some(analysis::compute_run_summary(
+        let mut summary = analysis::compute_run_summary(
             comparator.as_ref(),
             &endpoint_names,
             &yellowstone_endpoint_names,
-        ))
+        );
+        if let Some(endpoint) = preconf_endpoint.as_ref() {
+            summary.helius_preconf = Some(analysis::compute_helius_preconf_summary(
+                comparator.as_ref(),
+                preconf_comparator.as_ref(),
+                &primary_endpoints,
+                &endpoint.name,
+            ));
+        }
+        Some(summary)
     } else {
         None
     };
@@ -390,7 +456,7 @@ async fn main() -> Result<()> {
                 summary,
                 comparator.as_ref(),
                 &config.config,
-                &config.endpoint,
+                &primary_endpoints,
                 start_time_local,
                 run_finished_at_unix_secs,
             )
@@ -427,5 +493,35 @@ async fn main() -> Result<()> {
         info!("Benchmark aborted before completion; no results were generated");
     }
 
+    if let Some(message) = preconf_failure {
+        return Err(anyhow!("Helius preconf provider failed: {message}"));
+    }
+    if preconf_not_ready && !aborted.load(Ordering::Acquire) {
+        return Err(anyhow!(
+            "Helius preconf subscription was not acknowledged before the run ended"
+        ));
+    }
+
     Ok(())
+}
+
+fn is_sensitive_dependency_log_target(target: &str) -> bool {
+    target == "tungstenite::handshake::client"
+        || target.starts_with("tungstenite::handshake::client::")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_sensitive_dependency_log_target;
+
+    #[test]
+    fn identifies_tungstenite_handshake_logs_that_can_contain_api_keys() {
+        assert!(is_sensitive_dependency_log_target(
+            "tungstenite::handshake::client"
+        ));
+        assert!(is_sensitive_dependency_log_target(
+            "tungstenite::handshake::client::tests"
+        ));
+        assert!(!is_sensitive_dependency_log_target("tungstenite::protocol"));
+    }
 }

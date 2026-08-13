@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     fs::OpenOptions,
     io::Write,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tracing::{info, warn};
@@ -22,6 +22,7 @@ pub struct TransactionData {
 pub struct Comparator {
     data: DashMap<String, HashMap<String, TransactionData>>,
     emitted: DashSet<String>,
+    ready: AtomicBool,
 }
 
 impl Comparator {
@@ -29,6 +30,7 @@ impl Comparator {
         Self {
             data: DashMap::new(),
             emitted: DashSet::new(),
+            ready: AtomicBool::new(false),
         }
     }
 
@@ -86,6 +88,20 @@ impl Comparator {
 
     pub fn iter(&self) -> dashmap::iter::Iter<'_, String, HashMap<String, TransactionData>> {
         self.data.iter()
+    }
+
+    pub fn observation_for(&self, signature: &str, endpoint: &str) -> Option<TransactionData> {
+        self.data
+            .get(signature)
+            .and_then(|entry| entry.value().get(endpoint).cloned())
+    }
+
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
     }
 }
 
@@ -205,8 +221,16 @@ fn sanitize_filename(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::protobuf_timestamp_to_unix_ms;
+    use super::{Comparator, protobuf_timestamp_to_unix_ms};
     use prost_types::Timestamp;
+
+    #[test]
+    fn comparator_readiness_is_explicit() {
+        let comparator = Comparator::new();
+        assert!(!comparator.is_ready());
+        comparator.mark_ready();
+        assert!(comparator.is_ready());
+    }
 
     #[test]
     fn protobuf_timestamp_to_unix_ms_rejects_invalid_nanos() {

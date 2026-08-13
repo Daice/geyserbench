@@ -97,10 +97,34 @@ pub struct YellowstoneEndpointLocalSummary {
 pub struct RunSummary {
     pub endpoints: Vec<EndpointSummary>,
     pub yellowstone_created_at: Option<YellowstoneCreatedAtSummary>,
+    pub helius_preconf: Option<HeliusPreconfSummary>,
     pub fastest_endpoint: Option<String>,
     pub has_data: bool,
     pub total_signatures: usize,
     pub backfill_signatures: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeliusPreconfSummary {
+    pub reference_endpoint: String,
+    pub unique_signatures: usize,
+    pub per_endpoint: Vec<HeliusPreconfEndpointSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HeliusPreconfEndpointSummary {
+    pub endpoint: String,
+    pub endpoint_kind: String,
+    pub matched_signatures: usize,
+    pub missing_by_run_end: usize,
+    pub coverage_rate: Option<f64>,
+    pub preconf_faster: usize,
+    pub endpoint_faster: usize,
+    pub ties: usize,
+    pub avg_delta_ms: Option<f64>,
+    pub p50_delta_ms: Option<f64>,
+    pub p95_delta_ms: Option<f64>,
+    pub p99_delta_ms: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +138,8 @@ pub struct MetricsReport {
     pub per_endpoint: BTreeMap<String, MetricsEndpointReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub yellowstone_created_at: Option<MetricsYellowstoneCreatedAtReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helius_preconf: Option<HeliusPreconfSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,10 +279,86 @@ pub fn compute_run_summary(
     RunSummary {
         endpoints,
         yellowstone_created_at,
+        helius_preconf: None,
         fastest_endpoint,
         has_data,
         total_signatures,
         backfill_signatures,
+    }
+}
+
+pub fn compute_helius_preconf_summary(
+    comparator: &Comparator,
+    preconf_comparator: &Comparator,
+    endpoints: &[Endpoint],
+    reference_endpoint: &str,
+) -> HeliusPreconfSummary {
+    let preconf_observations = preconf_comparator
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value()
+                .get(reference_endpoint)
+                .cloned()
+                .map(|observation| (entry.key().clone(), observation))
+        })
+        .collect::<Vec<_>>();
+    let unique_signatures = preconf_observations.len();
+
+    let per_endpoint = endpoints
+        .iter()
+        .filter(|endpoint| !endpoint.kind.is_preconf())
+        .map(|endpoint| {
+            let mut deltas_ms = Vec::new();
+            let mut preconf_faster = 0usize;
+            let mut endpoint_faster = 0usize;
+            let mut ties = 0usize;
+
+            for (signature, preconf_observation) in &preconf_observations {
+                let Some(endpoint_observation) =
+                    comparator.observation_for(signature, &endpoint.name)
+                else {
+                    continue;
+                };
+
+                match endpoint_observation
+                    .elapsed_since_start
+                    .cmp(&preconf_observation.elapsed_since_start)
+                {
+                    Ordering::Greater => preconf_faster += 1,
+                    Ordering::Less => endpoint_faster += 1,
+                    Ordering::Equal => ties += 1,
+                }
+                deltas_ms.push(signed_diff_ms(
+                    endpoint_observation.elapsed_since_start,
+                    preconf_observation.elapsed_since_start,
+                ));
+            }
+
+            deltas_ms.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap_or(Ordering::Equal));
+            let matched_signatures = deltas_ms.len();
+            HeliusPreconfEndpointSummary {
+                endpoint: endpoint.name.clone(),
+                endpoint_kind: endpoint.kind.as_str().to_string(),
+                matched_signatures,
+                missing_by_run_end: unique_signatures.saturating_sub(matched_signatures),
+                coverage_rate: ratio(matched_signatures, unique_signatures),
+                preconf_faster,
+                endpoint_faster,
+                ties,
+                avg_delta_ms: (!deltas_ms.is_empty())
+                    .then(|| deltas_ms.iter().sum::<f64>() / deltas_ms.len() as f64),
+                p50_delta_ms: percentile_if_any(&deltas_ms, 0.5),
+                p95_delta_ms: percentile_if_any(&deltas_ms, 0.95),
+                p99_delta_ms: percentile_if_any(&deltas_ms, 0.99),
+            }
+        })
+        .collect();
+
+    HeliusPreconfSummary {
+        reference_endpoint: reference_endpoint.to_string(),
+        unique_signatures,
+        per_endpoint,
     }
 }
 
@@ -335,6 +437,10 @@ pub fn display_run_summary(summary: &RunSummary) {
     if let Some(yellowstone_summary) = summary.yellowstone_created_at.as_ref() {
         display_yellowstone_created_at_summary(yellowstone_summary);
     }
+
+    if let Some(preconf_summary) = summary.helius_preconf.as_ref() {
+        display_helius_preconf_summary(preconf_summary);
+    }
 }
 
 pub fn build_metrics_report(
@@ -395,6 +501,7 @@ pub fn build_metrics_report(
         backfill_signatures: summary.backfill_signatures,
         per_endpoint,
         yellowstone_created_at,
+        helius_preconf: summary.helius_preconf.clone(),
     }
 }
 
@@ -803,6 +910,60 @@ fn display_yellowstone_created_at_summary(summary: &YellowstoneCreatedAtSummary)
     println!("{table}");
 }
 
+fn display_helius_preconf_summary(summary: &HeliusPreconfSummary) {
+    println!("\nHelius preconf signature comparison");
+    println!("--------------------------------------------");
+    println!(
+        "Reference endpoint: {}; unique preconf signatures: {}",
+        summary.reference_endpoint, summary.unique_signatures
+    );
+    println!(
+        "Δ = endpoint receipt - preconf receipt; positive means preconf was faster. Missing means not observed by benchmark end."
+    );
+
+    if summary.unique_signatures == 0 {
+        println!("Not enough data");
+        return;
+    }
+
+    let mut table = Table::new();
+    table.load_preset(table_preset());
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        "Endpoint",
+        "Kind",
+        "Matched",
+        "Missing",
+        "Coverage %",
+        "Preconf Faster",
+        "Endpoint Faster",
+        "Ties",
+        "Avg Δ ms",
+        "P50 Δ ms",
+        "P95 Δ ms",
+        "P99 Δ ms",
+    ]);
+
+    for endpoint in &summary.per_endpoint {
+        table.add_row(vec![
+            endpoint.endpoint.clone(),
+            endpoint.endpoint_kind.clone(),
+            endpoint.matched_signatures.to_string(),
+            endpoint.missing_by_run_end.to_string(),
+            format_ratio(endpoint.coverage_rate),
+            endpoint.preconf_faster.to_string(),
+            endpoint.endpoint_faster.to_string(),
+            endpoint.ties.to_string(),
+            format_latency_value(endpoint.avg_delta_ms),
+            format_latency_value(endpoint.p50_delta_ms),
+            format_latency_value(endpoint.p95_delta_ms),
+            format_latency_value(endpoint.p99_delta_ms),
+        ]);
+    }
+
+    println!("{table}");
+}
+
 fn collect_comparable_endpoints(report: &MetricsReport) -> BTreeMap<String, MetricsComparisonSide> {
     report
         .per_endpoint
@@ -847,6 +1008,14 @@ fn diff_ms(tx: &TransactionData, first_tx: &TransactionData) -> f64 {
         .elapsed_since_start
         .saturating_sub(first_tx.elapsed_since_start);
     delta.as_secs_f64() * 1_000.0
+}
+
+fn signed_diff_ms(lhs: Duration, rhs: Duration) -> f64 {
+    if lhs >= rhs {
+        lhs.saturating_sub(rhs).as_secs_f64() * 1_000.0
+    } else {
+        -(rhs.saturating_sub(lhs).as_secs_f64() * 1_000.0)
+    }
 }
 
 fn build_summary(
@@ -1032,7 +1201,8 @@ fn ordering_to_winner(ordering: Ordering) -> ComparisonWinner {
 mod tests {
     use super::{
         ComparisonWinner, MetricsEndpointReport, MetricsReport, YellowstoneEndpointLocalSummary,
-        build_metrics_report, compare_metrics_reports, compute_run_summary,
+        build_metrics_report, compare_metrics_reports, compute_helius_preconf_summary,
+        compute_run_summary,
     };
     use crate::{
         config::{ArgsCommitment, Config, Endpoint, EndpointKind},
@@ -1082,6 +1252,7 @@ mod tests {
             name: name.to_string(),
             url: url.to_string(),
             x_token: None,
+            region_include: Vec::new(),
             kind: EndpointKind::Yellowstone,
         }
     }
@@ -1091,7 +1262,18 @@ mod tests {
             name: name.to_string(),
             url: url.to_string(),
             x_token: None,
+            region_include: Vec::new(),
             kind: EndpointKind::YellowstoneDeshred,
+        }
+    }
+
+    fn endpoint(name: &str, kind: EndpointKind) -> Endpoint {
+        Endpoint {
+            name: name.to_string(),
+            url: "http://example.com".to_string(),
+            x_token: None,
+            region_include: Vec::new(),
+            kind,
         }
     }
 
@@ -1122,6 +1304,153 @@ mod tests {
             run_started_at_unix_secs,
             run_finished_at_unix_secs,
         )
+    }
+
+    #[test]
+    fn preconf_cohort_compares_each_endpoint_independently_with_signed_deltas() {
+        let comparator = Comparator::new();
+        comparator.add_batch(
+            "grpc-a",
+            HashMap::from([
+                ("sig-1".to_string(), tx(101.0, 100.0, 15, None)),
+                ("sig-2".to_string(), tx(102.0, 100.0, 20, None)),
+                ("sig-3".to_string(), tx(103.0, 100.0, 25, None)),
+                ("ordinary-only".to_string(), tx(104.0, 100.0, 40, None)),
+            ]),
+        );
+        comparator.add_batch(
+            "grpc-b",
+            HashMap::from([("sig-2".to_string(), tx(102.0, 100.0, 18, None))]),
+        );
+
+        let preconf = Comparator::new();
+        preconf.add_batch(
+            "preconf",
+            HashMap::from([
+                ("sig-1".to_string(), tx(101.0, 100.0, 10, None)),
+                ("sig-2".to_string(), tx(102.0, 100.0, 20, None)),
+                ("sig-3".to_string(), tx(103.0, 100.0, 30, None)),
+                ("sig-4".to_string(), tx(104.0, 100.0, 40, None)),
+            ]),
+        );
+
+        let endpoints = vec![
+            endpoint("grpc-a", EndpointKind::Yellowstone),
+            endpoint("grpc-b", EndpointKind::Arpc),
+        ];
+        let summary = compute_helius_preconf_summary(&comparator, &preconf, &endpoints, "preconf");
+
+        assert_eq!(summary.unique_signatures, 4);
+        let first = &summary.per_endpoint[0];
+        assert_eq!(first.matched_signatures, 3);
+        assert_eq!(first.missing_by_run_end, 1);
+        assert_eq!(first.coverage_rate, Some(0.75));
+        assert_eq!(first.preconf_faster, 1);
+        assert_eq!(first.endpoint_faster, 1);
+        assert_eq!(first.ties, 1);
+        assert_eq!(first.avg_delta_ms, Some(0.0));
+        assert_eq!(first.p50_delta_ms, Some(0.0));
+        assert_eq!(first.p95_delta_ms, Some(5.0));
+
+        let second = &summary.per_endpoint[1];
+        assert_eq!(second.matched_signatures, 1);
+        assert_eq!(second.missing_by_run_end, 3);
+        assert_eq!(second.coverage_rate, Some(0.25));
+        assert_eq!(second.endpoint_faster, 1);
+        assert_eq!(
+            first.preconf_faster + first.endpoint_faster + first.ties,
+            first.matched_signatures
+        );
+    }
+
+    #[test]
+    fn preconf_zero_baseline_has_no_rate_or_latency() {
+        let summary = compute_helius_preconf_summary(
+            &Comparator::new(),
+            &Comparator::new(),
+            &[endpoint("grpc", EndpointKind::Yellowstone)],
+            "preconf",
+        );
+
+        assert_eq!(summary.unique_signatures, 0);
+        let endpoint = &summary.per_endpoint[0];
+        assert_eq!(endpoint.matched_signatures, 0);
+        assert_eq!(endpoint.missing_by_run_end, 0);
+        assert_eq!(endpoint.coverage_rate, None);
+        assert_eq!(endpoint.p50_delta_ms, None);
+    }
+
+    #[test]
+    fn preconf_nonempty_baseline_with_no_match_reports_missing_without_a_win() {
+        let preconf = Comparator::new();
+        preconf.record_observation("preconf", "sig-1", tx(101.0, 100.0, 10, None), 1);
+
+        let summary = compute_helius_preconf_summary(
+            &Comparator::new(),
+            &preconf,
+            &[endpoint("grpc", EndpointKind::Yellowstone)],
+            "preconf",
+        );
+
+        let endpoint = &summary.per_endpoint[0];
+        assert_eq!(endpoint.matched_signatures, 0);
+        assert_eq!(endpoint.missing_by_run_end, 1);
+        assert_eq!(endpoint.coverage_rate, Some(0.0));
+        assert_eq!(endpoint.preconf_faster, 0);
+        assert_eq!(endpoint.endpoint_faster, 0);
+        assert_eq!(endpoint.ties, 0);
+        assert_eq!(endpoint.avg_delta_ms, None);
+    }
+
+    #[test]
+    fn preconf_duplicate_observations_keep_earliest_timestamp() {
+        let comparator = Comparator::new();
+        comparator.record_observation("grpc", "sig-1", tx(101.0, 100.0, 20, None), 1);
+        let preconf = Comparator::new();
+        preconf.record_observation("preconf", "sig-1", tx(101.0, 100.0, 15, None), 1);
+        preconf.record_observation("preconf", "sig-1", tx(101.0, 100.0, 10, None), 1);
+
+        let summary = compute_helius_preconf_summary(
+            &comparator,
+            &preconf,
+            &[endpoint("grpc", EndpointKind::Yellowstone)],
+            "preconf",
+        );
+
+        assert_eq!(summary.unique_signatures, 1);
+        assert_eq!(summary.per_endpoint[0].p50_delta_ms, Some(10.0));
+    }
+
+    #[test]
+    fn metrics_json_keeps_preconf_optional_and_reads_old_reports() {
+        let comparator = Comparator::new();
+        comparator.add_batch(
+            "ys-a",
+            HashMap::from([("sig-1".to_string(), tx(101.0, 100.0, 10, Some(5.0)))]),
+        );
+        let report = yellowstone_report(
+            &comparator,
+            yellowstone_endpoint("ys-a", "https://example.com"),
+            100.0,
+            110.0,
+        );
+
+        let old_json = serde_json::to_string(&report).expect("report should serialize");
+        assert!(!old_json.contains("helius_preconf"));
+        let parsed: MetricsReport =
+            serde_json::from_str(&old_json).expect("old report should still deserialize");
+        assert!(parsed.helius_preconf.is_none());
+
+        let mut with_preconf = report;
+        with_preconf.helius_preconf = Some(super::HeliusPreconfSummary {
+            reference_endpoint: "preconf".to_string(),
+            unique_signatures: 1,
+            per_endpoint: Vec::new(),
+        });
+        let new_json = serde_json::to_string(&with_preconf).expect("report should serialize");
+        let parsed: MetricsReport =
+            serde_json::from_str(&new_json).expect("new report should deserialize");
+        assert_eq!(parsed.helius_preconf, with_preconf.helius_preconf);
     }
 
     #[test]
@@ -1653,6 +1982,7 @@ mod tests {
             total_signatures: 240,
             backfill_signatures: 0,
             yellowstone_created_at: None,
+            helius_preconf: None,
             per_endpoint: BTreeMap::from([
                 (
                     "Local".to_string(),
@@ -1741,6 +2071,7 @@ mod tests {
             total_signatures: 240,
             backfill_signatures: 0,
             yellowstone_created_at: None,
+            helius_preconf: None,
             per_endpoint: BTreeMap::from([(
                 "Local Deshred".to_string(),
                 MetricsEndpointReport {
